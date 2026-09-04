@@ -1,0 +1,143 @@
+======================================================================
+SFP MODULE DIAGNOSTIC ANALYSIS - DETAILED SUMMARY
+======================================================================
+
+Generated: 2026-09-04 04:49:20
+Log files analyzed: ['sw-A', 'sw-B']
+Total data points: 2421
+
+
+======================================================================
+SWITCH: sw-A
+======================================================================
+
+
+--- Interface: et-0/0/48 ---
+Samples collected: 303
+
+⚠️  ISSUES DETECTED:
+  • FEC uncorrected errors: 552
+  • Link went DOWN 1 times
+
+
+--- Interface: et-0/0/49 ---
+Samples collected: 303
+
+✓ No issues detected
+
+
+--- Interface: et-0/0/50 ---
+Samples collected: 303
+
+Statistics:
+  rx_power_dbm:
+    Min: -0.610, Max: -0.610, Mean: -0.610, Std: nan
+    Trend: stable
+  tx_power_dbm:
+    Min: 1.630, Max: 1.630, Mean: 1.630, Std: nan
+    Trend: stable
+  bias_current:
+    Min: 6.499, Max: 6.499, Mean: 6.499, Std: nan
+    Trend: stable
+  temperature:
+    Min: 25.000, Max: 25.000, Mean: 25.000, Std: nan
+    Trend: stable
+
+⚠️  ISSUES DETECTED:
+  • FEC uncorrected errors: 75481
+
+
+--- Interface: et-0/0/51 ---
+Samples collected: 302
+
+Statistics:
+  rx_power_dbm:
+    Min: -1.220, Max: -0.880, Mean: -1.065, Std: 0.064
+    Trend: stable
+  tx_power_dbm:
+    Min: 0.220, Max: 0.240, Mean: 0.231, Std: 0.008
+    Trend: stable
+  bias_current:
+    Min: 6.677, Max: 6.719, Mean: 6.698, Std: 0.013
+    Trend: stable
+  temperature:
+    Min: 32.000, Max: 39.000, Mean: 38.040, Std: 1.516
+    Trend: stable
+
+⚠️  ISSUES DETECTED:
+  • RX power LOW ALARM triggered
+
+
+======================================================================
+SWITCH: sw-B
+======================================================================
+
+
+--- Interface: et-0/0/48 ---
+Samples collected: 303
+
+⚠️  ISSUES DETECTED:
+  • FEC uncorrected errors: 652781
+  • Link went DOWN 1 times
+
+
+--- Interface: et-0/0/49 ---
+Samples collected: 303
+
+⚠️  ISSUES DETECTED:
+  • FEC uncorrected errors: 1582
+
+
+--- Interface: et-0/0/50 ---
+Samples collected: 303
+
+Statistics:
+  rx_power_dbm:
+    Min: -1.420, Max: -0.840, Mean: -1.130, Std: 0.410
+    Trend: stable
+  tx_power_dbm:
+    Min: 1.970, Max: 1.970, Mean: 1.970, Std: 0.000
+    Trend: stable
+  bias_current:
+    Min: 7.199, Max: 7.199, Mean: 7.199, Std: 0.000
+    Trend: stable
+  temperature:
+    Min: 43.000, Max: 44.000, Mean: 43.500, Std: 0.707
+    Trend: stable
+
+⚠️  ISSUES DETECTED:
+  • FEC uncorrected errors: 1288
+  • RX power LOW ALARM triggered
+
+
+--- Interface: et-0/0/51 ---
+Samples collected: 301
+
+Statistics:
+  rx_power_dbm:
+    Min: -1.640, Max: -1.410, Mean: -1.555, Std: 0.030
+    Trend: stable
+  tx_power_dbm:
+    Min: -0.590, Max: -0.240, Mean: -0.400, Std: 0.068
+    Trend: stable
+  bias_current:
+    Min: 7.361, Max: 7.662, Mean: 7.520, Std: 0.045
+    Trend: stable
+  temperature:
+    Min: 32.000, Max: 40.000, Mean: 37.960, Std: 1.145
+    Trend: stable
+
+✓ No issues detected
+
+
+======================================================================
+RECOMMENDATIONS
+======================================================================
+
+• HIGH: Investigate sw-A et-0/0/48 - FEC uncorrected errors: 552
+• HIGH: Investigate sw-A et-0/0/50 - FEC uncorrected errors: 75481
+• URGENT: Replace SFP on sw-A et-0/0/51 - RX power LOW ALARM triggered
+• HIGH: Investigate sw-B et-0/0/48 - FEC uncorrected errors: 652781
+• HIGH: Investigate sw-B et-0/0/49 - FEC uncorrected errors: 1582
+• HIGH: Investigate sw-B et-0/0/50 - FEC uncorrected errors: 1288
+• URGENT: Replace SFP on sw-B et-0/0/50 - RX power LOW ALARM triggered
