@@ -1,0 +1,64 @@
+================================================================================
+SFP MODULE DIAGNOSTIC REPORT - Test2_swA
+Generated: 2026-09-04 10:08:21
+================================================================================
+
+SUMMARY
+----------------------------------------
+Total Ports Analyzed: 3
+Healthy Ports: 0
+Ports with Issues: 3
+Total Alarms: 0
+Overall Health Status: Issues Detected
+
+PER-PORT ANALYSIS
+----------------------------------------
+
+Port: et-0/0/48
+  Part Number: 4021040058
+  Type: SR4
+  Position: A48
+  Measurements: 257
+  Uptime: 100.00%
+  Issues Detected:
+    [HIGH] Uncorrectable FEC errors: 552
+
+Port: et-0/0/49
+  Part Number: 4021040060
+  Type: SR4
+  Position: B49
+  Measurements: 257
+  Uptime: 100.00%
+  Issues Detected:
+    [HIGH] Uncorrectable FEC errors: 1549
+
+Port: et-0/0/50
+  Part Number: 4021040059
+  Type: SR4
+  Position: A50
+  Measurements: 257
+  Uptime: 100.00%
+  Statistics:
+    temperature: min=26.000, max=29.000, avg=27.996, std=0.437
+    bias_current_mA: min=6.543, max=6.543, avg=6.543, std=0.000
+    output_power_dbm: min=1.438, max=1.438, avg=1.438, std=0.000
+    rx_power_dbm: min=-1.560, max=-1.384, avg=-1.485, std=0.043
+  Issues Detected:
+    [HIGH] Uncorrectable FEC errors: 75481
+
+
+ALL ISSUES SUMMARY
+----------------------------------------
+[et-0/0/48] [HIGH] Uncorrectable FEC errors: 552
+[et-0/0/49] [HIGH] Uncorrectable FEC errors: 1549
+[et-0/0/50] [HIGH] Uncorrectable FEC errors: 75481
+
+
+RECOMMENDATIONS
+----------------------------------------
+HIGH PRIORITY:
+  - et-0/0/48: Uncorrectable FEC errors: 552
+  - et-0/0/49: Uncorrectable FEC errors: 1549
+  - et-0/0/50: Uncorrectable FEC errors: 75481
+  Recommended action: Immediate investigation required
+

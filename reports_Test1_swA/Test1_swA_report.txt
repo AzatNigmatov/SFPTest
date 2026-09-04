@@ -1,0 +1,75 @@
+================================================================================
+SFP MODULE DIAGNOSTIC REPORT - Test1_swA
+Generated: 2026-09-04 10:08:08
+================================================================================
+
+SUMMARY
+----------------------------------------
+Total Ports Analyzed: 4
+Healthy Ports: 2
+Ports with Issues: 2
+Total Alarms: 0
+Overall Health Status: Issues Detected
+
+PER-PORT ANALYSIS
+----------------------------------------
+
+Port: et-0/0/48
+  Part Number: QGA9882482
+  Type: SR4
+  Position: A48
+  Measurements: 303
+  Uptime: 99.67%
+  Issues Detected:
+    [HIGH] Link instability detected. Uptime: 99.67%
+    [HIGH] Uncorrectable FEC errors: 552
+
+Port: et-0/0/49
+  Part Number: QGA9882272
+  Type: SR4
+  Position: B48
+  Measurements: 303
+  Uptime: 100.00%
+
+Port: et-0/0/50
+  Part Number: QGA9882273
+  Type: SR4
+  Position: A49
+  Measurements: 303
+  Uptime: 100.00%
+  Statistics:
+    temperature: min=24.000, max=24.000, avg=24.000, std=0.000
+    bias_current_mA: min=6.465, max=6.465, avg=6.465, std=0.000
+    output_power_dbm: min=1.323, max=1.323, avg=1.323, std=0.000
+    rx_power_dbm: min=-1.148, max=-1.148, avg=-1.148, std=0.000
+  Issues Detected:
+    [HIGH] Uncorrectable FEC errors: 75481
+
+Port: et-0/0/51
+  Part Number: QGA9882479
+  Type: SR4
+  Position: B49
+  Measurements: 302
+  Uptime: 100.00%
+  Statistics:
+    temperature: min=30.000, max=37.000, avg=36.136, std=1.480
+    bias_current_mA: min=6.702, max=6.759, avg=6.745, std=0.007
+    output_power_dbm: min=0.182, max=0.203, avg=0.193, std=0.004
+    rx_power_dbm: min=-1.210, max=-0.931, avg=-1.085, std=0.055
+
+
+ALL ISSUES SUMMARY
+----------------------------------------
+[et-0/0/48] [HIGH] Link instability detected. Uptime: 99.67%
+[et-0/0/48] [HIGH] Uncorrectable FEC errors: 552
+[et-0/0/50] [HIGH] Uncorrectable FEC errors: 75481
+
+
+RECOMMENDATIONS
+----------------------------------------
+HIGH PRIORITY:
+  - et-0/0/48: Link instability detected. Uptime: 99.67%
+  - et-0/0/48: Uncorrectable FEC errors: 552
+  - et-0/0/50: Uncorrectable FEC errors: 75481
+  Recommended action: Immediate investigation required
+
