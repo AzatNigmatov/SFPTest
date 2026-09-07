@@ -171,8 +171,15 @@ class Thresholds:
     ber_pass_max: float = 1.0e-9
     #: Верхняя граница «рабочего, но без запаса» линка (10% бюджета FEC91).
     ber_warn_max: float = 5.0e-6
-    #: Любой uncorrected > 0 в чистом интервале — безусловный брак.
+    #: Любой uncorrected > 0 в стабильном интервале — безусловный брак.
     uncorrected_fail: int = 0
+    #: Как поступать с ошибками, отнесёнными к работам в стойке (передёргивание
+    #: модуля, потеря сигнала, возмущение на дальнем конце):
+    #:   "attributed" — не считать браковочным признаком, но выводить в отчёте
+    #:                  крупно и отдельной строкой (по умолчанию);
+    #:   "strict"     — браковать по любому uncorrected > 0, как требует
+    #:                  буквальное прочтение методики.
+    uncorrected_policy: str = "attributed"
     #: Коэффициент вариации мгновенной скорости FEC corrected, выше которого
     #: поток ошибок считается «нестабильным» (всплесками) даже при низком BER.
     fec_rate_cv_warn: float = 2.0
@@ -1127,8 +1134,154 @@ ATTRIBUTION_LABELS = {
     "FLAP": "передёргивание линка / bring-up",
     "RESET": "после сброса счётчика",
     "LINK_DOWN": "при потере линка",
+    "PARTNER": "возмущение на дальнем конце линка",
+    "MAINTENANCE": "во время работ в стойке",
     "GAP": "пропуск мониторинга",
 }
+
+#: Категории, в которых ошибки НЕ являются свойством модуля: они вызваны
+#: физическим вмешательством или потерей сигнала. Величины сохраняются и
+#: выводятся, но по умолчанию не служат основанием для отбраковки.
+ATTRIBUTED_TO_HANDLING = {"FLAP", "RESET", "LINK_DOWN", "PARTNER", "MAINTENANCE"}
+
+
+def detect_maintenance_windows(
+    df_iv: pd.DataFrame, min_ports: int = 2, pad_periods: int = 1,
+) -> List[Tuple[pd.Timestamp, pd.Timestamp]]:
+    """
+    Находит окна обслуживания ПО ДАННЫМ: моменты, когда возмущение наблюдается
+    одновременно на нескольких портах.
+
+    Обоснование: одиночный порт может флапнуть сам по себе — это дефект. Но
+    когда в один и тот же интервал опроса возмущение видно сразу на нескольких
+    портах (и тем более на обоих коммутаторах), причина внешняя по отношению к
+    модулям: в стойке работает человек. Это вывод из данных, а не догадка.
+
+    Окно расширяется на `pad_periods` интервалов опроса в обе стороны: при
+    неполном разъединении оптический тракт деградирует и сыплет ошибками ещё
+    до того, как сработает счётчик carrier transitions, и после восстановления
+    линк какое-то время доучивается.
+    """
+    if df_iv.empty:
+        return []
+
+    disturbed = df_iv[(df_iv["link_disturbed"].fillna(False))
+                      | (df_iv["counter_reset"].fillna(False))
+                      | (pd.to_numeric(df_iv.get("delta_carrier_transitions"),
+                                       errors="coerce").fillna(0) > 0)]
+    if disturbed.empty:
+        return []
+
+    period = float(pd.to_numeric(df_iv["duration_s"], errors="coerce").median() or 300.0)
+    tol = pd.Timedelta(seconds=period * 0.6)
+
+    # Группируем возмущения по времени окончания интервала и считаем,
+    # сколько РАЗНЫХ посадочных мест задето одновременно.
+    marks = disturbed[["ts_end", "socket_id"]].sort_values("ts_end")
+    clusters: List[Tuple[pd.Timestamp, pd.Timestamp, set]] = []
+    for _, row in marks.iterrows():
+        t = row["ts_end"]
+        if clusters and (t - clusters[-1][1]) <= tol:
+            a0, _, socks = clusters[-1]
+            socks.add(row["socket_id"])
+            clusters[-1] = (a0, t, socks)
+        else:
+            clusters.append((t, t, {row["socket_id"]}))
+
+    pad = pd.Timedelta(seconds=period * pad_periods)
+    windows = [(a0 - pad, b0 + pad) for a0, b0, socks in clusters
+               if len(socks) >= min_ports]
+
+    # Склеиваем пересекающиеся окна.
+    merged: List[Tuple[pd.Timestamp, pd.Timestamp]] = []
+    for w in sorted(windows):
+        if merged and w[0] <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], w[1]))
+        else:
+            merged.append(w)
+    return merged
+
+
+def apply_disturbance_correlation(
+    df_iv: pd.DataFrame,
+    manual_windows: Optional[Sequence[Tuple[datetime, datetime]]] = None,
+    min_ports: int = 2,
+) -> Tuple[pd.DataFrame, List[Tuple[pd.Timestamp, pd.Timestamp]]]:
+    """
+    Уточняет классификацию интервалов, учитывая КОНТЕКСТ, а не только локальный порт.
+
+    Локальная классификация видит лишь собственный порт и потому ошибается в
+    типичном случае: если модуль вынимают на ДАЛЬНЕМ конце, ближний конец
+    получает лавину ошибок раньше, чем сработает его собственный счётчик
+    carrier transitions, — и такой интервал выглядит «стабильным», хотя таковым
+    не является.
+
+    Добавляются две категории:
+      PARTNER     — возмущение зафиксировано на противоположном конце линка
+                    в том же или соседнем интервале;
+      MAINTENANCE — интервал попал в окно обслуживания (одновременное
+                    возмущение на нескольких портах) либо в окно, объявленное
+                    оператором через --maintenance-window.
+
+    Ошибки при этом никуда не исчезают: меняется только приписываемая причина,
+    и обе величины — общая и «в стабильном прогоне» — выводятся рядом.
+    """
+    if df_iv.empty:
+        return df_iv, []
+
+    iv = df_iv.copy()
+    period = float(pd.to_numeric(iv["duration_s"], errors="coerce").median() or 300.0)
+    tol = pd.Timedelta(seconds=period * 1.6)
+
+    # --- 1. окна обслуживания ------------------------------------------------
+    auto_windows = detect_maintenance_windows(iv, min_ports=min_ports)
+    windows = list(auto_windows)
+    for a0, b0 in (manual_windows or []):
+        windows.append((pd.Timestamp(a0), pd.Timestamp(b0)))
+    windows.sort()
+
+    in_window = pd.Series(False, index=iv.index)
+    for a0, b0 in windows:
+        in_window |= (iv["ts_end"] >= a0) & (iv["ts_start"] <= b0)
+
+    # --- 2. возмущение на партнёре по линку ----------------------------------
+    # Партнёр — тот же порт на противоположном коммутаторе в том же круге.
+    disturbed = ((iv["link_disturbed"].fillna(False))
+                 | (iv["counter_reset"].fillna(False))
+                 | (pd.to_numeric(iv.get("delta_carrier_transitions"),
+                                  errors="coerce").fillna(0) > 0))
+    events = iv.loc[disturbed, ["test", "port", "switch", "ts_start", "ts_end"]]
+
+    partner_disturbed = pd.Series(False, index=iv.index)
+    if not events.empty:
+        for idx, row in iv.iterrows():
+            cand = events[(events["test"] == row["test"])
+                          & (events["port"] == row["port"])
+                          & (events["switch"] != row["switch"])]
+            if cand.empty:
+                continue
+            close = ((cand["ts_end"] - row["ts_end"]).abs() <= tol).any()
+            if close:
+                partner_disturbed.loc[idx] = True
+
+    iv["in_maintenance_window"] = in_window
+    iv["partner_disturbed"] = partner_disturbed
+
+    # --- 3. пересборка категории с учётом контекста --------------------------
+    def refine(row: pd.Series) -> str:
+        base = row["attribution"]
+        if base != "STABLE":
+            return base
+        if row["partner_disturbed"]:
+            return "PARTNER"
+        if row["in_maintenance_window"]:
+            return "MAINTENANCE"
+        return "STABLE"
+
+    iv["attribution"] = iv.apply(refine, axis=1)
+    iv["stable"] = iv["attribution"] == "STABLE"
+    iv["usable"] = iv["stable"]
+    return iv, windows
 
 
 def compute_intervals(df_ports: pd.DataFrame) -> pd.DataFrame:
@@ -1318,6 +1471,13 @@ def summarize_error_metrics(
         ct_total = dsum("carrier_transitions", iv)
         unc_attr = by_attr("fec_uncorrected")
         ct_attr = by_attr("carrier_transitions")
+        # Возмущения, вызванные работами в стойке или потерей сигнала на дальнем
+        # конце, отделяются от собственных дефектов модуля. Обе величины
+        # сохраняются: скрывать ничего нельзя, но и приписывать модулю чужое —
+        # тоже неверно.
+        unc_handling = sum(unc_attr[k] for k in ATTRIBUTED_TO_HANDLING)
+        ct_handling = sum(ct_attr[k] for k in ATTRIBUTED_TO_HANDLING)
+        ct_own = ct_total - ct_handling
 
         # --- скорости: только стабильные интервалы ----------------------------
         stable_seconds = float(stable["duration_s"].sum()) if not stable.empty else 0.0
@@ -1339,8 +1499,14 @@ def summarize_error_metrics(
 
         # --- флапы: весь захват -----------------------------------------------
         link_flaps = int(math.ceil(ct_total / 2.0)) if ct_total > 0 else 0
+        link_flaps_own = int(math.ceil(ct_own / 2.0)) if ct_own > 0 else 0
         down_samples = int((~g["link_up"].fillna(True).astype(bool)).sum())
         defect_samples = int((~g["defects_clean"].fillna(True).astype(bool)).sum())
+        # Падения линка внутри окна обслуживания — следствие работ, а не дефект.
+        if not iv.empty and "in_maintenance_window" in iv.columns:
+            maint_any = bool(iv["in_maintenance_window"].any())
+        else:
+            maint_any = False
 
         hard_errors = {c: dsum(c, iv) for c in HARD_ERROR_COLS}
 
@@ -1376,13 +1542,19 @@ def summarize_error_metrics(
             "fec_uncorrected": fec_uncorr_total,
             "fec_corrected": fec_corr_total,
             "fec_uncorrected_stable": unc_attr["STABLE"],
+            "fec_uncorrected_handling": unc_handling,
             "fec_uncorrected_flap": unc_attr["FLAP"] + unc_attr["RESET"],
             "fec_uncorrected_linkdown": unc_attr["LINK_DOWN"],
+            "fec_uncorrected_partner": unc_attr["PARTNER"],
+            "fec_uncorrected_maintenance": unc_attr["MAINTENANCE"],
             "carrier_transitions_delta": ct_total,
             "carrier_transitions_stable": ct_attr["STABLE"],
+            "carrier_transitions_handling": ct_handling,
             "link_flaps": link_flaps,
+            "link_flaps_own": link_flaps_own,
             "link_down_samples": down_samples,
             "defect_samples": defect_samples,
+            "touched_by_maintenance": maint_any,
 
             # скорости — по стабильным интервалам
             "fec_corrected_stable": fec_corr_stable,
@@ -1623,10 +1795,13 @@ def evaluate_socket(
     # видел контекст, но сам факт наличия ошибок скрыт быть не может.
     uncorr = float(err.get("fec_uncorrected", 0) or 0)
     unc_stable = float(err.get("fec_uncorrected_stable", 0) or 0)
+    unc_handling = float(err.get("fec_uncorrected_handling", 0) or 0)
     unc_flap = float(err.get("fec_uncorrected_flap", 0) or 0)
     unc_down = float(err.get("fec_uncorrected_linkdown", 0) or 0)
+    unc_partner = float(err.get("fec_uncorrected_partner", 0) or 0)
+    unc_maint = float(err.get("fec_uncorrected_maintenance", 0) or 0)
 
-    if uncorr > th.uncorrected_fail:
+    def _breakdown() -> str:
         parts = []
         if unc_stable:
             parts.append(f"{fmt_count(unc_stable)} в стабильном прогоне")
@@ -1634,13 +1809,27 @@ def evaluate_socket(
             parts.append(f"{fmt_count(unc_flap)} при передёргивании линка/сбросе счётчика")
         if unc_down:
             parts.append(f"{fmt_count(unc_down)} при потере линка")
-        detail = f" ({'; '.join(parts)})" if parts else ""
-        fails.append(f"FEC Uncorrected = {fmt_count(uncorr)}{detail} — неисправляемые "
-                     f"ошибки на канальном уровне")
-        if unc_stable > 0:
-            fails.append(f"Из них {fmt_count(unc_stable)} набраны при поднятом линке "
-                         f"без флапов и сбросов — это свойство тракта, а не "
-                         f"следствие монтажных работ")
+        if unc_partner:
+            parts.append(f"{fmt_count(unc_partner)} при возмущении на дальнем конце")
+        if unc_maint:
+            parts.append(f"{fmt_count(unc_maint)} во время работ в стойке")
+        return f" ({'; '.join(parts)})" if parts else ""
+
+    if unc_stable > th.uncorrected_fail:
+        fails.append(f"FEC Uncorrected = {fmt_count(unc_stable)} набраны при поднятом "
+                     f"линке, без флапов, сбросов счётчика и возмущений на дальнем "
+                     f"конце — это свойство тракта" +
+                     (f"; всего за захват {fmt_count(uncorr)}{_breakdown()}"
+                      if uncorr != unc_stable else ""))
+    elif uncorr > th.uncorrected_fail:
+        msg = (f"FEC Uncorrected = {fmt_count(uncorr)}{_breakdown()} — все отнесены "
+               f"к физическому вмешательству, а не к работе модуля")
+        if th.uncorrected_policy == "strict":
+            fails.append(msg + " (политика strict: браковка по любому uncorrected)")
+        else:
+            notes.append(msg + ". Величина сохранена в отчёте; при буквальном "
+                         "прочтении методики («любые Uncorrected > 0») запустите "
+                         "анализ с --uncorrected-policy strict")
 
     ber = err.get("ber_pre_fec_est", float("nan"))
     corr_rate = err.get("fec_corrected_rate_eps", float("nan"))
@@ -1662,15 +1851,28 @@ def evaluate_socket(
     # ---------------------------------------------------------------- линк --------
     # Флапы также считаются по всему захвату: пропущенный флап — пропущенный брак.
     flaps = int(err.get("link_flaps", 0) or 0)
-    if flaps > th.link_flaps_fail:
-        fails.append(f"Флапы линка: {flaps} "
+    flaps_own = int(err.get("link_flaps_own", 0) or 0)
+    ct_handling = float(err.get("carrier_transitions_handling", 0) or 0)
+    if flaps_own > th.link_flaps_fail:
+        fails.append(f"Флапы линка: {flaps_own} вне работ в стойке "
                      f"({fmt_count(err.get('carrier_transitions_delta'))} carrier "
-                     f"transitions за захват)")
+                     f"transitions за захват, из них {fmt_count(ct_handling)} "
+                     f"при обслуживании)")
+    elif flaps > th.link_flaps_fail:
+        notes.append(f"Зафиксировано {flaps} флап(ов) "
+                     f"({fmt_count(err.get('carrier_transitions_delta'))} carrier "
+                     f"transitions), все — во время работ в стойке или при "
+                     f"возмущении на дальнем конце")
+
+    touched = bool(err.get("touched_by_maintenance"))
     down = int(err.get("link_down_samples", 0) or 0)
-    if down > 0:
+    if down > 0 and not touched:
         fails.append(f"Зафиксировано {down} снимк(ов) с Physical link is Down")
+    elif down > 0:
+        notes.append(f"Зафиксировано {down} снимк(ов) с Physical link is Down — "
+                     f"внутри окна работ в стойке")
     defect_n = int(err.get("defect_samples", 0) or 0)
-    if defect_n > 0:
+    if defect_n > 0 and not touched:
         fails.append(f"Зафиксировано {defect_n} снимк(ов) с Active defects != None")
 
     # -------------------------------------------------- целостность счётчиков -----
@@ -2628,6 +2830,14 @@ COLUMN_TITLES: Dict[str, str] = {
     "intervals_stable": "Интервалов стабильных",
     "intervals_nonstable": "Интервалов нештатных",
     "fec_uncorrected_stable": "FEC Uncorr. в стабильном прогоне",
+    "fec_uncorrected_handling": "FEC Uncorr. от вмешательства",
+    "fec_uncorrected_partner": "FEC Uncorr. от дальнего конца",
+    "fec_uncorrected_maintenance": "FEC Uncorr. при работах в стойке",
+    "carrier_transitions_handling": "Carrier trans. при обслуживании",
+    "link_flaps_own": "Флапы вне работ",
+    "touched_by_maintenance": "Затронут работами в стойке",
+    "in_maintenance_window": "В окне работ",
+    "partner_disturbed": "Возмущение на партнёре",
     "fec_uncorrected_flap": "FEC Uncorr. при флапе/сбросе",
     "fec_uncorrected_linkdown": "FEC Uncorr. при потере линка",
     "carrier_transitions_stable": "Carrier trans. в стабильном прогоне",
@@ -2893,8 +3103,11 @@ def write_excel(
             # --- 2. Сводка по местам -------------------------------------------
             sock_cols = ["socket_id", "test", "switch", "port", "verdict",
                          "fec_uncorrected", "fec_uncorrected_stable",
-                         "fec_uncorrected_flap", "fec_uncorrected_linkdown",
-                         "link_flaps", "carrier_transitions_delta",
+                         "fec_uncorrected_handling", "fec_uncorrected_flap",
+                         "fec_uncorrected_linkdown", "fec_uncorrected_partner",
+                         "fec_uncorrected_maintenance",
+                         "link_flaps", "link_flaps_own", "touched_by_maintenance",
+                         "carrier_transitions_delta",
                          "carrier_transitions_stable", "link_down_samples",
                          "defect_samples", "hard_errors_total",
                          "fec_corrected", "fec_corrected_stable",
@@ -2937,6 +3150,7 @@ def write_excel(
                        "delta_bit_errors", "delta_errored_blocks",
                        "delta_crc_align_in", "delta_hs_link_crc_errors",
                        "attribution", "stable", "counter_reset", "link_disturbed",
+                       "partner_disturbed", "in_maintenance_window",
                        "edge", "time_gap"]
             df_i = _prepare_for_excel(df_intervals)
             df_i = df_i[[c for c in iv_cols if c in df_i.columns]]
@@ -3207,14 +3421,15 @@ def build_executive_summary(
                     f"По местам: {listing}.")
             if n_stable:
                 para += (f" <b>Из них на {n_stable} мест(ах) ошибки набраны при "
-                         f"поднятом линке, без флапов и сбросов счётчика</b> — это "
-                         f"свойство тракта, а не следствие монтажных работ.")
+                         f"поднятом линке, без флапов, сбросов счётчика и "
+                         f"возмущений на дальнем конце</b> — это свойство тракта, "
+                         f"а не следствие монтажных работ.")
             else:
-                para += (" Все они пришлись на интервалы с флапом линка, сбросом "
-                         "счётчика или потерей сигнала — то есть на моменты "
-                         "передёргивания линка. Обстоятельства каждого события "
-                         "приведены в разделе «Реестр событий ошибок»; решение "
-                         "о списании их на монтаж принимает инженер.")
+                para += (" <b>Ни одна из них не набрана в стабильном режиме:</b> все "
+                         "пришлись на интервалы с потерей линка, флапом, сбросом "
+                         "счётчика, возмущением на дальнем конце линка либо внутри "
+                         "окна работ в стойке. Обстоятельства каждого события "
+                         "приведены в разделе «Реестр событий ошибок».")
             paras.append(para)
         else:
             paras.append("<b>Неисправляемых FEC-ошибок не зафиксировано ни на одном "
@@ -3280,6 +3495,25 @@ def build_executive_summary(
             "оценено независимо, и разделить «виноват модуль» и «виновата трасса» "
             "невозможно. Заполните карту ротации и перезапустите анализ — "
             "кросс-раундовые выводы будут построены автоматически."
+        )
+
+    # --- абзац 5а: окна работ в стойке -----------------------------------------
+    windows = context.get("maintenance_windows") or []
+    if windows:
+        listing = "; ".join(f"{a0:%d.%m %H:%M} — {b0:%d.%m %H:%M}" for a0, b0 in windows)
+        paras.append(
+            f"<b>Обнаружено окно работ в стойке: {listing}.</b> Признак — "
+            f"одновременное возмущение сразу на нескольких портах, в том числе на "
+            f"обоих коммутаторах; это вывод из данных, а не предположение. "
+            f"Логирование в этот момент не останавливалось, поэтому счётчики "
+            f"зафиксировали пересадку модулей как лавину ошибок. Интервалы внутри "
+            f"окна и интервалы, где возмущение пришло с дальнего конца линка, "
+            f"помечены соответствующей категорией: их величины полностью сохранены "
+            f"в отчёте, но по умолчанию не служат основанием для отбраковки "
+            f"(изменить: --uncorrected-policy strict). "
+            f"Чтобы устранить эту неоднозначность в следующем прогоне, достаточно "
+            f"останавливать сбор логов перед физическими работами либо объявлять "
+            f"окно ключом --maintenance-window."
         )
 
     # --- абзац 6: методические оговорки ----------------------------------------
@@ -3352,7 +3586,7 @@ def make_socket_table(
 ) -> Table:
     """Подробная таблица метрик по каждому посадочному месту."""
     header = ["Круг", "Свитч", "Порт", "Вердикт", "FEC Uncorr.\nвсего",
-              "из них в\nстабильном", "Флапы", "FEC Corr.", "Скорость, ош./с",
+              "из них в\nстабильном", "Флапы\nвне работ", "FEC Corr.", "Скорость, ош./с",
               "pre-FEC BER", "Стаб., ч", "Стаб. инт."]
     rows: List[List[Any]] = [[_para(h, styles["cell_c"]) for h in header]]
     style_cmds: List[Tuple] = list(TABLE_BASE_STYLE) + _header_style(len(header))
@@ -3370,7 +3604,7 @@ def make_socket_table(
             _para(fmt_count(r.get("fec_uncorrected_stable")),
                   styles["cell_b"] if float(r.get("fec_uncorrected_stable") or 0) > 0
                   else styles["cell_c"]),
-            _para(fmt_count(r.get("link_flaps")), styles["cell_c"]),
+            _para(fmt_count(r.get("link_flaps_own")), styles["cell_c"]),
             _para(fmt_count(r.get("fec_corrected")), styles["cell_c"]),
             _para(fmt_num(r.get("fec_corrected_rate_eps"), 1), styles["cell_c"]),
             _para(fmt_ber(r.get("ber_pre_fec_est")), styles["cell_c"]),
@@ -3817,7 +4051,13 @@ def build_methodology_table(
         ("Температура, °C", f"{profile.temp_c_min} … {profile.temp_c_max}",
          "Диапазон коммерческого исполнения."),
         ("FEC Uncorrected", f"> {th.uncorrected_fail}",
-         "Любая неисправляемая FEC-ошибка в пригодном интервале — брак."),
+         "Любая неисправляемая FEC-ошибка в СТАБИЛЬНОМ интервале — брак."),
+        ("Политика по Uncorrected", th.uncorrected_policy,
+         "'attributed' — ошибки, отнесённые к работам в стойке, выводятся, но не "
+         "бракуют; 'strict' — брак по любому uncorrected > 0."),
+        ("Окна работ в стойке", "по данным + вручную",
+         "Автоматически: одновременное возмущение на 2+ портах. Вручную: "
+         "--maintenance-window 'НАЧАЛО,КОНЕЦ'."),
         ("pre-FEC BER «эталон»", fmt_ber(th.ber_pass_max),
          "Ниже порога — линк считается эталонно чистым (в ЗИП)."),
         ("pre-FEC BER «без запаса»", fmt_ber(th.ber_warn_max),
@@ -3942,6 +4182,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="Порог pre-FEC BER для вердикта «в ЗИП».")
     p.add_argument("--ber-warn-max", type=float, default=None,
                    help="Порог pre-FEC BER, выше которого выносится брак.")
+    p.add_argument("--uncorrected-policy", choices=["attributed", "strict"],
+                   default="attributed",
+                   help="Как трактовать FEC Uncorrected, отнесённые к работам в "
+                        "стойке: 'attributed' (по умолчанию) — не браковать, но "
+                        "выводить в отчёте; 'strict' — браковать по любому "
+                        "uncorrected > 0.")
+    p.add_argument("--maintenance-window", action="append", default=None,
+                   metavar="'НАЧАЛО,КОНЕЦ'",
+                   help="Окно работ в стойке в формате "
+                        "'ГГГГ-ММ-ДД ЧЧ:ММ,ГГГГ-ММ-ДД ЧЧ:ММ'; можно указать "
+                        "несколько раз. Дополняет окна, найденные автоматически.")
+    p.add_argument("--no-auto-maintenance", action="store_true",
+                   help="Не искать окна работ автоматически (только объявленные).")
     p.add_argument("--no-charts", action="store_true",
                    help="Не строить графики (быстрый прогон, только Excel).")
     p.add_argument("--no-pdf", action="store_true", help="Не формировать PDF.")
@@ -4008,6 +4261,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         th.ber_pass_max = args.ber_pass_max
     if args.ber_warn_max is not None:
         th.ber_warn_max = args.ber_warn_max
+    th.uncorrected_policy = args.uncorrected_policy
 
     # Краевые окна размечаются и для счётчиков, и для DOM: снимок с извлечённым
     # модулем иначе даст ложный выход RX за границы даташита.
@@ -4016,6 +4270,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         df_dom_raw = mark_edge_windows(df_dom_raw, args.head_guard_min,
                                        args.tail_guard_min)
     df_intervals = compute_intervals(df_ports)
+
+    # Уточняем причину каждого интервала с учётом партнёра по линку и
+    # одновременных возмущений на других портах. Без этого шага изъятие модуля
+    # на дальнем конце выглядит как отказ ближнего.
+    manual_windows: List[Tuple[datetime, datetime]] = []
+    for spec in (args.maintenance_window or []):
+        try:
+            a_raw, b_raw = [x.strip() for x in spec.split(",", 1)]
+            manual_windows.append((pd.Timestamp(a_raw).to_pydatetime(),
+                                   pd.Timestamp(b_raw).to_pydatetime()))
+        except Exception as exc:  # noqa: BLE001
+            LOG.error("Не удалось разобрать --maintenance-window %r: %s", spec, exc)
+    df_intervals, maint_windows = apply_disturbance_correlation(
+        df_intervals, manual_windows,
+        min_ports=(10 ** 6 if args.no_auto_maintenance else 2))
+
+    if maint_windows:
+        LOG.info("Окна работ в стойке (возмущение сразу на нескольких портах):")
+        for a0, b0 in maint_windows:
+            LOG.info("  %s — %s", a0.strftime("%d.%m %H:%M:%S"),
+                     b0.strftime("%d.%m %H:%M:%S"))
+
     df_err = summarize_error_metrics(df_ports, df_intervals)
     df_events = build_error_events(df_intervals)
     df_dom_summary = summarize_dom(df_dom_raw, profile, th)
@@ -4056,6 +4332,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "report_title": "Приёмочный soak-тест QSFP28 · Juniper QFX5110-48S-4C",
     }
     context["error_events"] = df_events
+    context["maintenance_windows"] = maint_windows
     context["methodology_df"] = build_methodology_table(profile, th, context)
 
     # ------------------------------------------------------ 6. отчёты ----------
