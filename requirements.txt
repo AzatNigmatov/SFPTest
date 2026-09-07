@@ -1,0 +1,9 @@
+# Зависимости анализатора soak-теста QSFP28.
+#   pip install -r requirements.txt
+#
+# Версии указаны как минимально проверенные; более свежие тоже подходят.
+pandas>=2.0
+numpy>=1.24
+openpyxl>=3.1          # запись .xlsx
+matplotlib>=3.7        # графики (и источник TTF DejaVu с кириллицей для PDF)
+reportlab>=4.0         # генерация PDF
