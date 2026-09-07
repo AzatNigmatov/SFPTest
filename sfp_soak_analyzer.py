@@ -171,8 +171,15 @@ class Thresholds:
     ber_pass_max: float = 1.0e-9
     #: Верхняя граница «рабочего, но без запаса» линка (10% бюджета FEC91).
     ber_warn_max: float = 5.0e-6
-    #: Любой uncorrected > 0 в чистом интервале — безусловный брак.
+    #: Любой uncorrected > 0 в стабильном интервале — безусловный брак.
     uncorrected_fail: int = 0
+    #: Как поступать с ошибками, отнесёнными к работам в стойке (передёргивание
+    #: модуля, потеря сигнала, возмущение на дальнем конце):
+    #:   "attributed" — не считать браковочным признаком, но выводить в отчёте
+    #:                  крупно и отдельной строкой (по умолчанию);
+    #:   "strict"     — браковать по любому uncorrected > 0, как требует
+    #:                  буквальное прочтение методики.
+    uncorrected_policy: str = "attributed"
     #: Коэффициент вариации мгновенной скорости FEC corrected, выше которого
     #: поток ошибок считается «нестабильным» (всплесками) даже при низком BER.
     fec_rate_cv_warn: float = 2.0
@@ -193,6 +200,10 @@ class Thresholds:
     min_hours_for_drift: float = 6.0
     #: Минимальное число снимков DOM для оценки перекоса между линиями.
     min_samples_for_dom_stats: int = 12
+    #: Минимальная наработка в стабильном режиме, при которой модуль вообще
+    #: может быть аттестован в ЗИП, ч. Отсутствие ошибок за 15 минут не
+    #: доказывает ничего: методика soak-теста предполагает 24-48 часов.
+    min_hours_for_pass: float = 12.0
     #: Полный дрейф TX/RX за прогон, приводящий к WARNING / FAIL, дБ.
     power_drift_warn_db: float = 1.0
     power_drift_fail_db: float = 2.0
@@ -1087,6 +1098,192 @@ def mark_edge_windows(
     return df
 
 
+def classify_interval(row: pd.Series) -> str:
+    """
+    Классифицирует интервал по ДОКАЗАТЕЛЬСТВАМ из самого лога, а не по догадкам
+    о том, что делал оператор.
+
+    Категории (в порядке приоритета):
+      LINK_DOWN — на одном из концов линк не Up или есть Active defects:
+                  ошибки набраны при потере сигнала;
+      RESET     — счётчик уменьшился: интерфейс пересоздан или выполнен
+                  `clear interfaces statistics`; значение после сброса — это
+                  накопление «с нуля», а не продолжение ряда;
+      FLAP      — вырос carrier transitions при поднятом линке: линк передёрнули
+                  (пересадка модуля, переобучение), ошибки относятся к bring-up;
+      GAP       — аномально длинный интервал: мониторинг не работал, данные неполны;
+      STABLE    — линк Up, дефектов нет, флапов нет, сбросов нет.
+
+    Ошибки в STABLE — это свойство тракта. Ошибки в остальных категориях
+    требуют инженерного решения, но ЗАМАЛЧИВАТЬ их нельзя ни в каком случае.
+    """
+    if row.get("link_disturbed"):
+        return "LINK_DOWN"
+    if row.get("counter_reset"):
+        return "RESET"
+    if float(row.get("delta_carrier_transitions") or 0) > 0:
+        return "FLAP"
+    if row.get("time_gap"):
+        return "GAP"
+    return "STABLE"
+
+
+#: Человекочитаемые названия категорий для отчётов.
+ATTRIBUTION_LABELS = {
+    "STABLE": "стабильный прогон",
+    "FLAP": "передёргивание линка / bring-up",
+    "RESET": "после сброса счётчика",
+    "LINK_DOWN": "при потере линка",
+    "PARTNER": "возмущение на дальнем конце линка",
+    "MAINTENANCE": "во время работ в стойке",
+    "GAP": "пропуск мониторинга",
+}
+
+#: Категории, в которых ошибки НЕ являются свойством модуля: они вызваны
+#: физическим вмешательством или потерей сигнала. Величины сохраняются и
+#: выводятся, но по умолчанию не служат основанием для отбраковки.
+ATTRIBUTED_TO_HANDLING = {"FLAP", "RESET", "LINK_DOWN", "PARTNER", "MAINTENANCE"}
+
+
+def detect_maintenance_windows(
+    df_iv: pd.DataFrame, min_ports: int = 2, pad_periods: int = 1,
+) -> List[Tuple[pd.Timestamp, pd.Timestamp]]:
+    """
+    Находит окна обслуживания ПО ДАННЫМ: моменты, когда возмущение наблюдается
+    одновременно на нескольких портах.
+
+    Обоснование: одиночный порт может флапнуть сам по себе — это дефект. Но
+    когда в один и тот же интервал опроса возмущение видно сразу на нескольких
+    портах (и тем более на обоих коммутаторах), причина внешняя по отношению к
+    модулям: в стойке работает человек. Это вывод из данных, а не догадка.
+
+    Окно расширяется на `pad_periods` интервалов опроса в обе стороны: при
+    неполном разъединении оптический тракт деградирует и сыплет ошибками ещё
+    до того, как сработает счётчик carrier transitions, и после восстановления
+    линк какое-то время доучивается.
+    """
+    if df_iv.empty:
+        return []
+
+    disturbed = df_iv[(df_iv["link_disturbed"].fillna(False))
+                      | (df_iv["counter_reset"].fillna(False))
+                      | (pd.to_numeric(df_iv.get("delta_carrier_transitions"),
+                                       errors="coerce").fillna(0) > 0)]
+    if disturbed.empty:
+        return []
+
+    period = float(pd.to_numeric(df_iv["duration_s"], errors="coerce").median() or 300.0)
+    tol = pd.Timedelta(seconds=period * 0.6)
+
+    # Группируем возмущения по времени окончания интервала и считаем,
+    # сколько РАЗНЫХ посадочных мест задето одновременно.
+    marks = disturbed[["ts_end", "socket_id"]].sort_values("ts_end")
+    clusters: List[Tuple[pd.Timestamp, pd.Timestamp, set]] = []
+    for _, row in marks.iterrows():
+        t = row["ts_end"]
+        if clusters and (t - clusters[-1][1]) <= tol:
+            a0, _, socks = clusters[-1]
+            socks.add(row["socket_id"])
+            clusters[-1] = (a0, t, socks)
+        else:
+            clusters.append((t, t, {row["socket_id"]}))
+
+    pad = pd.Timedelta(seconds=period * pad_periods)
+    windows = [(a0 - pad, b0 + pad) for a0, b0, socks in clusters
+               if len(socks) >= min_ports]
+
+    # Склеиваем пересекающиеся окна.
+    merged: List[Tuple[pd.Timestamp, pd.Timestamp]] = []
+    for w in sorted(windows):
+        if merged and w[0] <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], w[1]))
+        else:
+            merged.append(w)
+    return merged
+
+
+def apply_disturbance_correlation(
+    df_iv: pd.DataFrame,
+    manual_windows: Optional[Sequence[Tuple[datetime, datetime]]] = None,
+    min_ports: int = 2,
+) -> Tuple[pd.DataFrame, List[Tuple[pd.Timestamp, pd.Timestamp]]]:
+    """
+    Уточняет классификацию интервалов, учитывая КОНТЕКСТ, а не только локальный порт.
+
+    Локальная классификация видит лишь собственный порт и потому ошибается в
+    типичном случае: если модуль вынимают на ДАЛЬНЕМ конце, ближний конец
+    получает лавину ошибок раньше, чем сработает его собственный счётчик
+    carrier transitions, — и такой интервал выглядит «стабильным», хотя таковым
+    не является.
+
+    Добавляются две категории:
+      PARTNER     — возмущение зафиксировано на противоположном конце линка
+                    в том же или соседнем интервале;
+      MAINTENANCE — интервал попал в окно обслуживания (одновременное
+                    возмущение на нескольких портах) либо в окно, объявленное
+                    оператором через --maintenance-window.
+
+    Ошибки при этом никуда не исчезают: меняется только приписываемая причина,
+    и обе величины — общая и «в стабильном прогоне» — выводятся рядом.
+    """
+    if df_iv.empty:
+        return df_iv, []
+
+    iv = df_iv.copy()
+    period = float(pd.to_numeric(iv["duration_s"], errors="coerce").median() or 300.0)
+    tol = pd.Timedelta(seconds=period * 1.6)
+
+    # --- 1. окна обслуживания ------------------------------------------------
+    auto_windows = detect_maintenance_windows(iv, min_ports=min_ports)
+    windows = list(auto_windows)
+    for a0, b0 in (manual_windows or []):
+        windows.append((pd.Timestamp(a0), pd.Timestamp(b0)))
+    windows.sort()
+
+    in_window = pd.Series(False, index=iv.index)
+    for a0, b0 in windows:
+        in_window |= (iv["ts_end"] >= a0) & (iv["ts_start"] <= b0)
+
+    # --- 2. возмущение на партнёре по линку ----------------------------------
+    # Партнёр — тот же порт на противоположном коммутаторе в том же круге.
+    disturbed = ((iv["link_disturbed"].fillna(False))
+                 | (iv["counter_reset"].fillna(False))
+                 | (pd.to_numeric(iv.get("delta_carrier_transitions"),
+                                  errors="coerce").fillna(0) > 0))
+    events = iv.loc[disturbed, ["test", "port", "switch", "ts_start", "ts_end"]]
+
+    partner_disturbed = pd.Series(False, index=iv.index)
+    if not events.empty:
+        for idx, row in iv.iterrows():
+            cand = events[(events["test"] == row["test"])
+                          & (events["port"] == row["port"])
+                          & (events["switch"] != row["switch"])]
+            if cand.empty:
+                continue
+            close = ((cand["ts_end"] - row["ts_end"]).abs() <= tol).any()
+            if close:
+                partner_disturbed.loc[idx] = True
+
+    iv["in_maintenance_window"] = in_window
+    iv["partner_disturbed"] = partner_disturbed
+
+    # --- 3. пересборка категории с учётом контекста --------------------------
+    def refine(row: pd.Series) -> str:
+        base = row["attribution"]
+        if base != "STABLE":
+            return base
+        if row["partner_disturbed"]:
+            return "PARTNER"
+        if row["in_maintenance_window"]:
+            return "MAINTENANCE"
+        return "STABLE"
+
+    iv["attribution"] = iv.apply(refine, axis=1)
+    iv["stable"] = iv["attribution"] == "STABLE"
+    iv["usable"] = iv["stable"]
+    return iv, windows
+
+
 def compute_intervals(df_ports: pd.DataFrame) -> pd.DataFrame:
     """
     Превращает ряд кумулятивных счётчиков в ряд поинтервальных дельт.
@@ -1097,11 +1294,14 @@ def compute_intervals(df_ports: pd.DataFrame) -> pd.DataFrame:
                             статистики или пересоздание интерфейса);
       * `link_disturbed`  = True, если на любом конце интервала линк не Up
                             либо присутствуют Active defects;
-      * `time_gap`        = True, если длительность интервала аномально велика
-                            (пропуск в работе монитора);
-      * `usable`          = интервал пригоден для расчёта метрик надёжности.
+      * `time_gap`        = True, если длительность интервала аномально велика;
+      * `attribution`     = категория из classify_interval();
+      * `stable`          = интервал прошёл в штатном режиме.
 
-    Возвращает DataFrame интервалов (на один короче исходного ряда по каждому сокету).
+    ВАЖНО: интервалы НЕ выбрасываются. Ни одна ошибка не исчезает из учёта —
+    меняется только то, в какую категорию она попадёт. Скорости и BER считаются
+    по стабильным интервалам (иначе они не имеют смысла), а жёсткие счётчики
+    ошибок — по всему захвату целиком.
     """
     if df_ports.empty:
         return pd.DataFrame()
@@ -1132,9 +1332,10 @@ def compute_intervals(df_ports: pd.DataFrame) -> pd.DataFrame:
             b = pd.to_numeric(nxt[col], errors="coerce")
             d = b - a
             reset_flag |= d.fillna(0) < 0
-            iv[f"delta_{col}"] = d
+            # Отрицательная дельта означает сброс: значение ПОСЛЕ сброса — это
+            # накопление с нуля, и именно оно является приростом за интервал.
+            iv[f"delta_{col}"] = d.where(d >= 0, b)
 
-        # Состояние линка на концах интервала.
         link_bad = (~cur["link_up"].fillna(False).astype(bool)
                     | ~nxt["link_up"].fillna(False).astype(bool))
         defects_bad = (~cur["defects_clean"].fillna(True).astype(bool)
@@ -1144,18 +1345,74 @@ def compute_intervals(df_ports: pd.DataFrame) -> pd.DataFrame:
         iv["edge"] = (cur["edge"].fillna(False).astype(bool).values
                       | nxt["edge"].fillna(False).astype(bool).values)
 
-        # Пропуск в мониторинге: интервал длиннее 3 медиан.
         med = iv["duration_s"].median()
         iv["time_gap"] = (iv["duration_s"] > max(3.0 * med, med + 300.0)
                           if med and math.isfinite(med) else False)
 
-        iv["usable"] = ~(iv["link_disturbed"] | iv["counter_reset"]
-                         | iv["edge"] | iv["time_gap"])
+        iv["attribution"] = iv.apply(classify_interval, axis=1)
+        iv["stable"] = iv["attribution"] == "STABLE"
+        # Совместимость с прежним полем: пригодность для расчёта СКОРОСТЕЙ.
+        iv["usable"] = iv["stable"]
         frames.append(iv)
 
     if not frames:
         return pd.DataFrame()
     out = pd.concat(frames, ignore_index=True)
+    out.sort_values(["test", "switch", "port", "ts_start"], inplace=True,
+                    kind="mergesort")
+    out.reset_index(drop=True, inplace=True)
+    return out
+
+
+def build_error_events(df_iv: pd.DataFrame) -> pd.DataFrame:
+    """
+    Реестр КАЖДОГО события ошибки: интервал, в котором вырос хоть один жёсткий
+    счётчик или счётчик carrier transitions.
+
+    Это основной инструмент разбора: инженер видит, что именно произошло, когда,
+    и в каком состоянии был линк в этот момент, — и может сам решить, списывать
+    ли событие на пересадку модуля. Раньше эта информация терялась.
+    """
+    if df_iv.empty:
+        return pd.DataFrame()
+
+    watch = ["fec_uncorrected", "carrier_transitions", "fec_corrected"] + HARD_ERROR_COLS
+    cols = [f"delta_{c}" for c in watch if f"delta_{c}" in df_iv.columns]
+    if not cols:
+        return pd.DataFrame()
+
+    mask = pd.Series(False, index=df_iv.index)
+    for c in cols:
+        if c == "delta_fec_corrected":
+            continue  # исправленные считаем отдельно, они есть почти всегда
+        mask |= pd.to_numeric(df_iv[c], errors="coerce").fillna(0) > 0
+
+    ev = df_iv[mask].copy()
+    if ev.empty:
+        return pd.DataFrame()
+
+    out = pd.DataFrame({
+        "test": ev["test"],
+        "switch": ev["switch"],
+        "port": ev["port"],
+        "socket_id": ev["socket_id"],
+        "ts_start": ev["ts_start"],
+        "ts_end": ev["ts_end"],
+        "attribution": ev["attribution"].map(ATTRIBUTION_LABELS).fillna(ev["attribution"]),
+        "attribution_code": ev["attribution"],
+        "fec_uncorrected": pd.to_numeric(ev.get("delta_fec_uncorrected"),
+                                         errors="coerce").fillna(0),
+        "fec_corrected": pd.to_numeric(ev.get("delta_fec_corrected"),
+                                       errors="coerce").fillna(0),
+        "carrier_transitions": pd.to_numeric(ev.get("delta_carrier_transitions"),
+                                             errors="coerce").fillna(0),
+        "counter_reset": ev["counter_reset"],
+        "link_disturbed": ev["link_disturbed"],
+    })
+    for c in HARD_ERROR_COLS:
+        key = f"delta_{c}"
+        if key in ev.columns:
+            out[c] = pd.to_numeric(ev[key], errors="coerce").fillna(0)
     out.sort_values(["test", "switch", "port", "ts_start"], inplace=True,
                     kind="mergesort")
     out.reset_index(drop=True, inplace=True)
@@ -1168,9 +1425,16 @@ def summarize_error_metrics(
     """
     Агрегирует метрики надёжности по каждому сокету.
 
-    Все накопительные величины считаются ТОЛЬКО по «пригодным» (usable)
-    интервалам; события, попавшие в краевые окна или в момент сброса счётчика,
-    учитываются отдельно как `edge_*` и выводятся в отчёт справочно.
+    Принцип разделения, исправляющий ключевой методический дефект:
+
+      * ЖЁСТКИЕ счётчики (FEC uncorrected, флапы, input/CRC/bit errors)
+        суммируются по ВСЕМУ захвату. Ни одно окно, ни один фильтр не может
+        обнулить их: это первичные признаки браковки.
+      * СКОРОСТИ и оценочный BER считаются только по стабильным интервалам —
+        делить лавину ошибок момента пересадки модуля на время бессмысленно.
+      * Дополнительно тот же жёсткий счётчик раскладывается по категориям
+        (стабильный прогон / флап / сброс / потеря линка), чтобы инженер видел
+        обстоятельства, а не только итог.
     """
     if df_ports.empty:
         return pd.DataFrame()
@@ -1187,58 +1451,71 @@ def summarize_error_metrics(
         except KeyError:
             iv = pd.DataFrame()
 
-        good = iv[iv["usable"]] if not iv.empty else pd.DataFrame()
-        edge = iv[~iv["usable"]] if not iv.empty else pd.DataFrame()
+        stable = iv[iv["stable"]] if not iv.empty else pd.DataFrame()
 
-        def gsum(col: str, frame: pd.DataFrame = good) -> float:
+        def dsum(col: str, frame: pd.DataFrame) -> float:
             key = f"delta_{col}"
             if frame.empty or key not in frame.columns:
                 return 0.0
-            return float(pd.to_numeric(frame[key], errors="coerce").clip(lower=0).sum())
+            return float(pd.to_numeric(frame[key], errors="coerce").fillna(0)
+                         .clip(lower=0).sum())
 
-        soak_seconds = float(good["duration_s"].sum()) if not good.empty else 0.0
-        span_seconds = ((g["ts"].max() - g["ts"].min()).total_seconds()
-                        if len(g) > 1 else 0.0)
+        def by_attr(col: str) -> Dict[str, float]:
+            if iv.empty:
+                return {k: 0.0 for k in ATTRIBUTION_LABELS}
+            return {k: dsum(col, iv[iv["attribution"] == k]) for k in ATTRIBUTION_LABELS}
 
-        fec_corr = gsum("fec_corrected")
-        fec_uncorr = gsum("fec_uncorrected")
+        # --- жёсткие счётчики: ВЕСЬ захват ------------------------------------
+        fec_uncorr_total = dsum("fec_uncorrected", iv)
+        fec_corr_total = dsum("fec_corrected", iv)
+        ct_total = dsum("carrier_transitions", iv)
+        unc_attr = by_attr("fec_uncorrected")
+        ct_attr = by_attr("carrier_transitions")
+        # Возмущения, вызванные работами в стойке или потерей сигнала на дальнем
+        # конце, отделяются от собственных дефектов модуля. Обе величины
+        # сохраняются: скрывать ничего нельзя, но и приписывать модулю чужое —
+        # тоже неверно.
+        unc_handling = sum(unc_attr[k] for k in ATTRIBUTED_TO_HANDLING)
+        ct_handling = sum(ct_attr[k] for k in ATTRIBUTED_TO_HANDLING)
+        ct_own = ct_total - ct_handling
 
-        # --- скорость и оценочный pre-FEC BER ----------------------------------
-        corr_rate = fec_corr / soak_seconds if soak_seconds > 0 else float("nan")
-        uncorr_rate = fec_uncorr / soak_seconds if soak_seconds > 0 else float("nan")
-        ber_pre_fec = corr_rate / LINE_RATE_BPS if soak_seconds > 0 else float("nan")
+        # --- скорости: только стабильные интервалы ----------------------------
+        stable_seconds = float(stable["duration_s"].sum()) if not stable.empty else 0.0
+        fec_corr_stable = dsum("fec_corrected", stable)
+        corr_rate = (fec_corr_stable / stable_seconds if stable_seconds > 0
+                     else float("nan"))
+        ber_pre_fec = corr_rate / LINE_RATE_BPS if stable_seconds > 0 else float("nan")
 
-        # Мгновенные скорости по интервалам — для оценки стабильности потока.
-        if not good.empty and "delta_fec_corrected" in good.columns:
-            inst = (pd.to_numeric(good["delta_fec_corrected"], errors="coerce").clip(lower=0)
-                    / good["duration_s"].replace(0, np.nan))
+        if not stable.empty and "delta_fec_corrected" in stable.columns:
+            inst = (pd.to_numeric(stable["delta_fec_corrected"], errors="coerce")
+                    .clip(lower=0) / stable["duration_s"].replace(0, np.nan))
             inst = inst.replace([np.inf, -np.inf], np.nan).dropna()
         else:
             inst = pd.Series(dtype=float)
-
         rate_max = float(inst.max()) if not inst.empty else float("nan")
         rate_mean = float(inst.mean()) if not inst.empty else float("nan")
         rate_std = float(inst.std(ddof=0)) if len(inst) > 1 else 0.0
         rate_cv = (rate_std / rate_mean) if (rate_mean and rate_mean > 0) else 0.0
-        intervals_with_corr = int((inst > 0).sum()) if not inst.empty else 0
 
-        # --- флапы линка --------------------------------------------------------
-        ct_delta = gsum("carrier_transitions")
-        # Одно событие «падение+подъём» даёт 2 carrier transition.
-        link_flaps = int(math.ceil(ct_delta / 2.0)) if ct_delta > 0 else 0
-        down_samples = int((~g["link_up"].fillna(True).astype(bool)
-                            & ~g["edge"].fillna(False).astype(bool)).sum())
-        defect_samples = int((~g["defects_clean"].fillna(True).astype(bool)
-                              & ~g["edge"].fillna(False).astype(bool)).sum())
+        # --- флапы: весь захват -----------------------------------------------
+        link_flaps = int(math.ceil(ct_total / 2.0)) if ct_total > 0 else 0
+        link_flaps_own = int(math.ceil(ct_own / 2.0)) if ct_own > 0 else 0
+        down_samples = int((~g["link_up"].fillna(True).astype(bool)).sum())
+        defect_samples = int((~g["defects_clean"].fillna(True).astype(bool)).sum())
+        # Падения линка внутри окна обслуживания — следствие работ, а не дефект.
+        if not iv.empty and "in_maintenance_window" in iv.columns:
+            maint_any = bool(iv["in_maintenance_window"].any())
+        else:
+            maint_any = False
 
-        # --- прочие жёсткие ошибки ----------------------------------------------
-        hard_errors = {c: gsum(c) for c in HARD_ERROR_COLS}
-        hard_total = float(sum(hard_errors.values()))
+        hard_errors = {c: dsum(c, iv) for c in HARD_ERROR_COLS}
 
-        # --- то, что произошло в краевых/исключённых интервалах ------------------
-        edge_corr = gsum("fec_corrected", edge)
-        edge_uncorr = gsum("fec_uncorrected", edge)
-        edge_ct = gsum("carrier_transitions", edge)
+        # --- целостность счётчиков --------------------------------------------
+        first_unc = pd.to_numeric(g["fec_uncorrected"], errors="coerce").dropna()
+        first_corr = pd.to_numeric(g["fec_corrected"], errors="coerce").dropna()
+        baseline_unc = float(first_unc.iloc[0]) if not first_unc.empty else float("nan")
+        baseline_corr = float(first_corr.iloc[0]) if not first_corr.empty else float("nan")
+        resets = int(iv["counter_reset"].sum()) if not iv.empty else 0
 
         rows.append({
             "socket_id": sid,
@@ -1253,33 +1530,48 @@ def summarize_error_metrics(
                          if "fec_mode" in g.columns and g["fec_mode"].notna().any() else None),
             "samples": int(len(g)),
             "intervals_total": int(len(iv)),
-            "intervals_usable": int(len(good)),
-            "intervals_excluded": int(len(edge)),
+            "intervals_stable": int(len(stable)),
+            "intervals_nonstable": int(len(iv) - len(stable)),
             "ts_start": g["ts"].min(),
             "ts_end": g["ts"].max(),
-            "span_seconds": span_seconds,
-            "soak_seconds": soak_seconds,
+            "span_seconds": ((g["ts"].max() - g["ts"].min()).total_seconds()
+                             if len(g) > 1 else 0.0),
+            "soak_seconds": stable_seconds,
 
-            "fec_corrected": fec_corr,
-            "fec_uncorrected": fec_uncorr,
-            "fec_corrected_rate_eps": corr_rate,
-            "fec_uncorrected_rate_eps": uncorr_rate,
-            "fec_corrected_rate_max_eps": rate_max,
-            "fec_rate_cv": rate_cv,
-            "intervals_with_corrected": intervals_with_corr,
-            "ber_pre_fec_est": ber_pre_fec,
-
-            "carrier_transitions_delta": ct_delta,
+            # жёсткие счётчики — по всему захвату
+            "fec_uncorrected": fec_uncorr_total,
+            "fec_corrected": fec_corr_total,
+            "fec_uncorrected_stable": unc_attr["STABLE"],
+            "fec_uncorrected_handling": unc_handling,
+            "fec_uncorrected_flap": unc_attr["FLAP"] + unc_attr["RESET"],
+            "fec_uncorrected_linkdown": unc_attr["LINK_DOWN"],
+            "fec_uncorrected_partner": unc_attr["PARTNER"],
+            "fec_uncorrected_maintenance": unc_attr["MAINTENANCE"],
+            "carrier_transitions_delta": ct_total,
+            "carrier_transitions_stable": ct_attr["STABLE"],
+            "carrier_transitions_handling": ct_handling,
             "link_flaps": link_flaps,
+            "link_flaps_own": link_flaps_own,
             "link_down_samples": down_samples,
             "defect_samples": defect_samples,
+            "touched_by_maintenance": maint_any,
+
+            # скорости — по стабильным интервалам
+            "fec_corrected_stable": fec_corr_stable,
+            "fec_corrected_rate_eps": corr_rate,
+            "fec_corrected_rate_max_eps": rate_max,
+            "fec_rate_cv": rate_cv,
+            "intervals_with_corrected": int((inst > 0).sum()) if not inst.empty else 0,
+            "ber_pre_fec_est": ber_pre_fec,
 
             **{f"err_{k}": v for k, v in hard_errors.items()},
-            "hard_errors_total": hard_total,
+            "hard_errors_total": float(sum(hard_errors.values())),
 
-            "edge_fec_corrected": edge_corr,
-            "edge_fec_uncorrected": edge_uncorr,
-            "edge_carrier_transitions": edge_ct,
+            # целостность данных
+            "counter_baseline_uncorrected": baseline_unc,
+            "counter_baseline_corrected": baseline_corr,
+            "counter_zero_based": bool(baseline_unc == 0 and baseline_corr == 0),
+            "counter_resets": resets,
         })
 
     df = pd.DataFrame(rows)
@@ -1289,9 +1581,6 @@ def summarize_error_metrics(
     return df
 
 
-# ======================================================================================
-#  7. ДВИЖОК DOM: СТАТИСТИКА, ДРЕЙФ, ПЕРЕКОС ЛИНИЙ, ПРОГРЕВ
-# ======================================================================================
 
 def summarize_dom(df_dom: pd.DataFrame, profile: OpticProfile,
                   th: Optional[Thresholds] = None) -> pd.DataFrame:
@@ -1500,10 +1789,47 @@ def evaluate_socket(
     notes: List[str] = []
 
     # ---------------------------------------------------------------- FEC ---------
+    # Неисправляемые FEC-ошибки — первичный признак браковки. Считаются по ВСЕМУ
+    # захвату и не могут быть обнулены ни одним окном или фильтром. Обстоятельства
+    # (стабильный прогон / флап / потеря линка) приводятся рядом, чтобы инженер
+    # видел контекст, но сам факт наличия ошибок скрыт быть не может.
     uncorr = float(err.get("fec_uncorrected", 0) or 0)
-    if uncorr > th.uncorrected_fail:
-        fails.append(f"FEC Uncorrected = {fmt_count(uncorr)} (> {th.uncorrected_fail}) "
-                     f"— неисправляемые ошибки на канальном уровне")
+    unc_stable = float(err.get("fec_uncorrected_stable", 0) or 0)
+    unc_handling = float(err.get("fec_uncorrected_handling", 0) or 0)
+    unc_flap = float(err.get("fec_uncorrected_flap", 0) or 0)
+    unc_down = float(err.get("fec_uncorrected_linkdown", 0) or 0)
+    unc_partner = float(err.get("fec_uncorrected_partner", 0) or 0)
+    unc_maint = float(err.get("fec_uncorrected_maintenance", 0) or 0)
+
+    def _breakdown() -> str:
+        parts = []
+        if unc_stable:
+            parts.append(f"{fmt_count(unc_stable)} в стабильном прогоне")
+        if unc_flap:
+            parts.append(f"{fmt_count(unc_flap)} при передёргивании линка/сбросе счётчика")
+        if unc_down:
+            parts.append(f"{fmt_count(unc_down)} при потере линка")
+        if unc_partner:
+            parts.append(f"{fmt_count(unc_partner)} при возмущении на дальнем конце")
+        if unc_maint:
+            parts.append(f"{fmt_count(unc_maint)} во время работ в стойке")
+        return f" ({'; '.join(parts)})" if parts else ""
+
+    if unc_stable > th.uncorrected_fail:
+        fails.append(f"FEC Uncorrected = {fmt_count(unc_stable)} набраны при поднятом "
+                     f"линке, без флапов, сбросов счётчика и возмущений на дальнем "
+                     f"конце — это свойство тракта" +
+                     (f"; всего за захват {fmt_count(uncorr)}{_breakdown()}"
+                      if uncorr != unc_stable else ""))
+    elif uncorr > th.uncorrected_fail:
+        msg = (f"FEC Uncorrected = {fmt_count(uncorr)}{_breakdown()} — все отнесены "
+               f"к физическому вмешательству, а не к работе модуля")
+        if th.uncorrected_policy == "strict":
+            fails.append(msg + " (политика strict: браковка по любому uncorrected)")
+        else:
+            notes.append(msg + ". Величина сохранена в отчёте; при буквальном "
+                         "прочтении методики («любые Uncorrected > 0») запустите "
+                         "анализ с --uncorrected-policy strict")
 
     ber = err.get("ber_pre_fec_est", float("nan"))
     corr_rate = err.get("fec_corrected_rate_eps", float("nan"))
@@ -1523,17 +1849,43 @@ def evaluate_socket(
                      f"— ошибки идут всплесками")
 
     # ---------------------------------------------------------------- линк --------
+    # Флапы также считаются по всему захвату: пропущенный флап — пропущенный брак.
     flaps = int(err.get("link_flaps", 0) or 0)
-    if flaps > th.link_flaps_fail:
-        fails.append(f"Флапы линка: {flaps} "
-                     f"({fmt_count(err.get('carrier_transitions_delta'))} carrier transitions)")
+    flaps_own = int(err.get("link_flaps_own", 0) or 0)
+    ct_handling = float(err.get("carrier_transitions_handling", 0) or 0)
+    if flaps_own > th.link_flaps_fail:
+        fails.append(f"Флапы линка: {flaps_own} вне работ в стойке "
+                     f"({fmt_count(err.get('carrier_transitions_delta'))} carrier "
+                     f"transitions за захват, из них {fmt_count(ct_handling)} "
+                     f"при обслуживании)")
+    elif flaps > th.link_flaps_fail:
+        notes.append(f"Зафиксировано {flaps} флап(ов) "
+                     f"({fmt_count(err.get('carrier_transitions_delta'))} carrier "
+                     f"transitions), все — во время работ в стойке или при "
+                     f"возмущении на дальнем конце")
+
+    touched = bool(err.get("touched_by_maintenance"))
     down = int(err.get("link_down_samples", 0) or 0)
-    if down > 0:
-        fails.append(f"Зафиксировано {down} снимк(ов) с Physical link is Down "
-                     f"вне краевых окон")
+    if down > 0 and not touched:
+        fails.append(f"Зафиксировано {down} снимк(ов) с Physical link is Down")
+    elif down > 0:
+        notes.append(f"Зафиксировано {down} снимк(ов) с Physical link is Down — "
+                     f"внутри окна работ в стойке")
     defect_n = int(err.get("defect_samples", 0) or 0)
-    if defect_n > 0:
+    if defect_n > 0 and not touched:
         fails.append(f"Зафиксировано {defect_n} снимк(ов) с Active defects != None")
+
+    # -------------------------------------------------- целостность счётчиков -----
+    if err.get("counter_zero_based") is False:
+        notes.append(
+            f"Счётчики не были обнулены перед прогоном (стартовые значения: "
+            f"corrected {fmt_count(err.get('counter_baseline_corrected'))}, "
+            f"uncorrected {fmt_count(err.get('counter_baseline_uncorrected'))}) — "
+            f"в метрику идёт прирост за захват, не абсолютное значение")
+    resets = int(err.get("counter_resets", 0) or 0)
+    if resets:
+        notes.append(f"Обнаружено сбросов счётчика: {resets} "
+                     f"(clear interfaces statistics либо пересоздание интерфейса)")
 
     # ------------------------------------------------- input / CRC / bit errors ---
     for col in HARD_ERROR_COLS:
@@ -1642,19 +1994,24 @@ def evaluate_socket(
                          f"{profile.bias_ma_typ_max} мА для {profile.name}")
 
     # -------------------------------------------------- достаточность выборки -----
-    usable = int(err.get("intervals_usable", 0) or 0)
+    usable = int(err.get("intervals_stable", 0) or 0)
     soak_h = float(err.get("soak_seconds", 0) or 0) / 3600.0
+    insufficient = usable == 0 or soak_h < th.min_hours_for_pass
     if usable == 0:
-        notes.append("Нет ни одного пригодного интервала — метрики надёжности не рассчитаны")
-    elif soak_h < 12:
-        notes.append(f"Полезная длительность прогона всего {soak_h:.1f} ч "
-                     f"(< 12 ч) — статистическая значимость ограничена")
+        notes.append("Нет ни одного стабильного интервала — метрики надёжности "
+                     "не рассчитаны")
+    elif insufficient:
+        notes.append(f"Наработка в стабильном режиме всего {soak_h:.1f} ч "
+                     f"(< {th.min_hours_for_pass:g} ч) — недостаточно для аттестации; "
+                     f"отсутствие ошибок за такой срок ничего не доказывает")
 
+    # Порядок важен: найденные дефекты остаются дефектами и при короткой
+    # выборке, а вот ПОЛОЖИТЕЛЬНЫЙ вердикт короткой выборкой не обосновывается.
     if fails:
         verdict = VERDICT_FAIL
     elif warns:
         verdict = VERDICT_WARN
-    elif usable == 0:
+    elif insufficient:
         verdict = VERDICT_UNKNOWN
     else:
         verdict = VERDICT_PASS
@@ -2258,66 +2615,98 @@ def chart_fec_timeline(
     iv: pd.DataFrame, title: str, out_path: Path,
 ) -> Optional[Path]:
     """
-    Всплески FEC во времени: мгновенная скорость исправленных ошибок и
-    накопленный счётчик неисправляемых — две панели, общая ось времени.
+    FEC во времени: скорость исправленных ошибок и события неисправляемых.
 
-    Исключённые интервалы (краевые окна, сбросы счётчика, link down) помечены
-    вертикальной заливкой, чтобы аналитик видел, какие участки не учитывались.
+    ВСЕ данные наносятся на график, включая нештатные интервалы — скрывать
+    ошибки нельзя. Нештатные участки (флап линка, сброс счётчика, потеря
+    сигнала) затенены серым: это подсказка о ПРИЧИНЕ, а не повод убрать
+    значение с графика. Каждое событие неисправляемых ошибок отмечается
+    отдельной маркой с подписью величины.
     """
     if iv.empty:
         return None
     try:
         fig, (ax_c, ax_u) = plt.subplots(
             2, 1, figsize=(9.6, 3.9), sharex=True,
-            gridspec_kw={"height_ratios": [1.4, 1.0], "hspace": 0.26})
+            gridspec_kw={"height_ratios": [1.2, 1.0], "hspace": 0.30})
 
-        g = iv.sort_values("ts_start")
+        g = iv.sort_values("ts_start").reset_index(drop=True)
         dur = g["duration_s"].replace(0, np.nan)
-        rate_c = (pd.to_numeric(g["delta_fec_corrected"], errors="coerce").clip(lower=0)
-                  / dur).replace([np.inf, -np.inf], np.nan)
-        rate_u = (pd.to_numeric(g["delta_fec_uncorrected"], errors="coerce").clip(lower=0)
-                  / dur).replace([np.inf, -np.inf], np.nan)
+        d_corr = pd.to_numeric(g["delta_fec_corrected"], errors="coerce").clip(lower=0)
+        d_unc = pd.to_numeric(g["delta_fec_uncorrected"], errors="coerce").clip(lower=0)
+        rate_c = (d_corr / dur).replace([np.inf, -np.inf], np.nan)
+        stable = (g["stable"].fillna(False).astype(bool)
+                  if "stable" in g.columns else pd.Series(True, index=g.index))
 
-        usable = g["usable"].fillna(False).astype(bool)
-
-        # Затеняем исключённые интервалы.
-        for _, row in g[~usable].iterrows():
+        # Затеняем нештатные интервалы — как контекст, а не как исключение.
+        for _, row in g[~stable].iterrows():
             for ax in (ax_c, ax_u):
                 ax.axvspan(row["ts_start"], row["ts_end"],
                            color=GRIDLINE, alpha=0.9, linewidth=0, zorder=0)
 
-        ax_c.plot(g["ts_start"], rate_c.where(usable), color=SERIES_COLORS[0],
+        # --- панель 1: скорость исправленных ошибок, ВЕСЬ ряд -------------------
+        ax_c.plot(g["ts_start"], rate_c, color=SERIES_COLORS[0],
                   linewidth=1.5, zorder=3)
-        ax_c.margins(y=0.22)   # запас сверху, чтобы подпись пика не липла к рамке
-        peak = rate_c.where(usable).max()
+        if (rate_c.dropna() > 0).any():
+            ax_c.set_yscale("symlog", linthresh=1.0)
+        ax_c.margins(y=0.25)
+        peak = rate_c.max()
         if pd.notna(peak) and peak > 0:
-            pk_idx = rate_c.where(usable).idxmax()
-            # Подпись пика уводим вниз-вбок: сверху её затирает заголовок панели.
+            pk = rate_c.idxmax()
             ax_c.annotate(f"пик {_thousands(float(peak))} ош./с",
-                          xy=(g.loc[pk_idx, "ts_start"], float(peak)),
+                          xy=(g.loc[pk, "ts_start"], float(peak)),
                           xytext=(7, -9), textcoords="offset points",
                           ha="left", va="top", fontsize=7.5, color=INK_SECONDARY)
-            ax_c.set_yscale("symlog", linthresh=1.0)
         ax_c.yaxis.set_major_formatter(FuncFormatter(_thousands))
         ax_c.set_ylabel("FEC corrected,\nошибок/с")
-        ax_c.set_title("Скорость исправленных FEC-ошибок (серым — исключённые интервалы)",
+        ax_c.set_title("Скорость исправленных FEC-ошибок "
+                       "(серым — нештатные интервалы: флап, сброс счётчика, потеря линка)",
                        loc="left")
         _despine(ax_c)
 
-        ax_u.plot(g["ts_start"], rate_u.where(usable), color=STATUS_CRITICAL,
-                  linewidth=1.5, zorder=3)
-        total_u = float(pd.to_numeric(g.loc[usable, "delta_fec_uncorrected"],
-                                      errors="coerce").clip(lower=0).sum())
-        ax_u.yaxis.set_major_formatter(FuncFormatter(_thousands))
-        ax_u.set_ylabel("FEC uncorrected,\nошибок/с")
-        ax_u.set_title(f"Неисправляемые FEC-ошибки — всего за прогон: "
-                       f"{_thousands(total_u)}", loc="left")
-        _despine(ax_u)
-        if total_u == 0:
+        # --- панель 2: события неисправляемых ошибок ---------------------------
+        total_u = float(d_unc.sum())
+        stable_u = float(d_unc[stable].sum())
+        events = g.index[d_unc > 0]
+
+        if total_u > 0:
+            # Ступенчатое накопление показывает, когда именно «прилетело».
+            ax_u.step(g["ts_end"], d_unc.cumsum(), where="post",
+                      color=INK_MUTED, linewidth=1.2, zorder=2,
+                      label="накоплено за захват")
+            for idx in events:
+                is_stable = bool(stable.iloc[idx])
+                color = STATUS_CRITICAL if is_stable else STATUS_WARNING
+                ax_u.plot([g.loc[idx, "ts_end"]], [d_unc.cumsum().iloc[idx]],
+                          marker="o" if is_stable else "^", markersize=6,
+                          color=color, markeredgecolor=SURFACE, markeredgewidth=0.8,
+                          zorder=4, linestyle="none")
+                ax_u.annotate(f"+{_thousands(float(d_unc.iloc[idx]))}",
+                              xy=(g.loc[idx, "ts_end"], d_unc.cumsum().iloc[idx]),
+                              xytext=(0, 7), textcoords="offset points",
+                              ha="center", fontsize=7, color=color, zorder=5)
+            ax_u.margins(y=0.30)
+            ax_u.yaxis.set_major_formatter(FuncFormatter(_thousands))
+            note = (f"из них {_thousands(stable_u)} в стабильном прогоне"
+                    if stable_u > 0 else
+                    "все — в нештатных интервалах (флап / сброс / потеря линка)")
+            ax_u.set_title(f"Неисправляемые FEC-ошибки: всего {_thousands(total_u)}, "
+                           f"{note}", loc="left")
+            # Легенда форм: круг — стабильный прогон, треугольник — нештатный.
+            ax_u.plot([], [], marker="o", linestyle="none", color=STATUS_CRITICAL,
+                      markersize=6, label="в стабильном прогоне")
+            ax_u.plot([], [], marker="^", linestyle="none", color=STATUS_WARNING,
+                      markersize=6, label="при флапе / сбросе / потере линка")
+            ax_u.legend(loc="upper left", ncol=3, handlelength=1.2,
+                        columnspacing=1.0, fontsize=7)
+        else:
             ax_u.set_ylim(-0.05, 1.0)
-            ax_u.annotate("ошибок не зафиксировано", xy=(0.5, 0.5),
+            ax_u.set_title("Неисправляемые FEC-ошибки: не зафиксировано", loc="left")
+            ax_u.annotate("за весь период наблюдения — ни одной", xy=(0.5, 0.5),
                           xycoords="axes fraction", ha="center", va="center",
                           fontsize=9, color=STATUS_GOOD)
+        ax_u.set_ylabel("FEC uncorrected,\nнакопленным итогом")
+        _despine(ax_u)
 
         span_h = ((g["ts_end"].max() - g["ts_start"].min()).total_seconds() / 3600.0
                   if len(g) > 1 else 1.0)
@@ -2438,8 +2827,38 @@ COLUMN_TITLES: Dict[str, str] = {
     "fec_mode": "Режим FEC",
     "samples": "Снимков",
     "intervals_total": "Интервалов всего",
-    "intervals_usable": "Интервалов пригодных",
-    "intervals_excluded": "Интервалов исключено",
+    "intervals_stable": "Интервалов стабильных",
+    "intervals_nonstable": "Интервалов нештатных",
+    "fec_uncorrected_stable": "FEC Uncorr. в стабильном прогоне",
+    "fec_uncorrected_handling": "FEC Uncorr. от вмешательства",
+    "fec_uncorrected_partner": "FEC Uncorr. от дальнего конца",
+    "fec_uncorrected_maintenance": "FEC Uncorr. при работах в стойке",
+    "carrier_transitions_handling": "Carrier trans. при обслуживании",
+    "link_flaps_own": "Флапы вне работ",
+    "touched_by_maintenance": "Затронут работами в стойке",
+    "in_maintenance_window": "В окне работ",
+    "partner_disturbed": "Возмущение на партнёре",
+    "fec_uncorrected_flap": "FEC Uncorr. при флапе/сбросе",
+    "fec_uncorrected_linkdown": "FEC Uncorr. при потере линка",
+    "carrier_transitions_stable": "Carrier trans. в стабильном прогоне",
+    "fec_corrected_stable": "FEC Corr. в стабильном прогоне",
+    "counter_baseline_corrected": "Стартовое значение FEC Corr.",
+    "counter_baseline_uncorrected": "Стартовое значение FEC Uncorr.",
+    "counter_zero_based": "Счётчики обнулены перед прогоном",
+    "counter_resets": "Сбросов счётчика",
+    "attribution": "Обстоятельства",
+    "carrier_transitions": "Carrier transitions",
+    "input_errors": "Input errors",
+    "hs_link_crc_errors": "HS link CRC errors",
+    "mtu_errors": "MTU errors",
+    "resource_errors": "Resource errors",
+    "fifo_errors": "FIFO errors",
+    "bit_errors": "Bit errors",
+    "errored_blocks": "Errored blocks",
+    "crc_align_in": "CRC/Align вход",
+    "crc_align_out": "CRC/Align выход",
+    "attribution_code": "Категория",
+    "stable": "Стабильный интервал",
     "ts_start": "Начало",
     "ts_end": "Окончание",
     "span_seconds": "Длительность захвата, с",
@@ -2458,9 +2877,6 @@ COLUMN_TITLES: Dict[str, str] = {
     "link_down_samples": "Снимков с link Down",
     "defect_samples": "Снимков с Active defects",
     "hard_errors_total": "Жёстких ошибок всего",
-    "edge_fec_corrected": "FEC Corr. в исключённых интервалах",
-    "edge_fec_uncorrected": "FEC Uncorr. в исключённых интервалах",
-    "edge_carrier_transitions": "Carrier transitions в исключённых интервалах",
     "verdict": "Вердикт",
     "final_verdict": "Итоговый вердикт",
     "rotation_conclusion": "Вывод по ротации",
@@ -2510,7 +2926,7 @@ COLUMN_TITLES: Dict[str, str] = {
     "ts_start_iv": "Начало интервала",
     "ts_end_iv": "Конец интервала",
     "duration_s": "Длительность, с",
-    "usable": "Учтён в метриках",
+    "usable": "Учтён в расчёте скоростей",
     "counter_reset": "Сброс счётчика",
     "link_disturbed": "Линк нарушен",
     "edge": "Краевое окно",
@@ -2542,6 +2958,13 @@ NUMBER_FORMATS: Dict[str, str] = {
     "b_ber": "0.00E+00",
     "fec_corrected": "# ##0",
     "fec_uncorrected": "# ##0",
+    "fec_uncorrected_stable": "# ##0",
+    "fec_uncorrected_flap": "# ##0",
+    "fec_uncorrected_linkdown": "# ##0",
+    "fec_corrected_stable": "# ##0",
+    "carrier_transitions_stable": "# ##0",
+    "counter_baseline_corrected": "# ##0",
+    "counter_baseline_uncorrected": "# ##0",
     "fec_corrected_rate_eps": "# ##0.000",
     "fec_uncorrected_rate_eps": "0.000000",
     "fec_corrected_rate_max_eps": "# ##0.000",
@@ -2679,14 +3102,22 @@ def write_excel(
 
             # --- 2. Сводка по местам -------------------------------------------
             sock_cols = ["socket_id", "test", "switch", "port", "verdict",
-                         "fec_uncorrected", "fec_corrected", "fec_corrected_rate_eps",
-                         "fec_corrected_rate_max_eps", "fec_rate_cv",
-                         "ber_pre_fec_est", "link_flaps", "carrier_transitions_delta",
-                         "link_down_samples", "defect_samples", "hard_errors_total",
-                         "samples", "intervals_usable", "intervals_excluded",
+                         "fec_uncorrected", "fec_uncorrected_stable",
+                         "fec_uncorrected_handling", "fec_uncorrected_flap",
+                         "fec_uncorrected_linkdown", "fec_uncorrected_partner",
+                         "fec_uncorrected_maintenance",
+                         "link_flaps", "link_flaps_own", "touched_by_maintenance",
+                         "carrier_transitions_delta",
+                         "carrier_transitions_stable", "link_down_samples",
+                         "defect_samples", "hard_errors_total",
+                         "fec_corrected", "fec_corrected_stable",
+                         "fec_corrected_rate_eps", "fec_corrected_rate_max_eps",
+                         "fec_rate_cv", "ber_pre_fec_est",
+                         "samples", "intervals_stable", "intervals_nonstable",
                          "soak_seconds", "ts_start", "ts_end", "fec_mode",
-                         "edge_fec_corrected", "edge_fec_uncorrected",
-                         "edge_carrier_transitions", "source_file", "reason_text"]
+                         "counter_zero_based", "counter_baseline_corrected",
+                         "counter_baseline_uncorrected", "counter_resets",
+                         "source_file", "reason_text"]
             df_s = _prepare_for_excel(df_sockets)
             keep = [c for c in sock_cols if c in df_s.columns]
             if "soak_hours" in df_s.columns:
@@ -2718,7 +3149,9 @@ def write_excel(
                        "delta_carrier_transitions", "delta_input_errors",
                        "delta_bit_errors", "delta_errored_blocks",
                        "delta_crc_align_in", "delta_hs_link_crc_errors",
-                       "usable", "counter_reset", "link_disturbed", "edge", "time_gap"]
+                       "attribution", "stable", "counter_reset", "link_disturbed",
+                       "partner_disturbed", "in_maintenance_window",
+                       "edge", "time_gap"]
             df_i = _prepare_for_excel(df_intervals)
             df_i = df_i[[c for c in iv_cols if c in df_i.columns]]
             sheets.append(("Временные ряды ошибок", df_i))
@@ -2730,10 +3163,25 @@ def write_excel(
             df_dr = df_dr[[c for c in dom_raw_cols if c in df_dr.columns]]
             sheets.append(("Временные ряды DOM", df_dr))
 
-            # --- 7. Методика и пороги ------------------------------------------
+            # --- 7. Реестр событий ошибок --------------------------------------
+            # Каждый интервал, в котором вырос хоть один жёсткий счётчик, — с
+            # временем и обстоятельствами. Именно здесь видно, что ошибка была,
+            # даже если по скоростным метрикам место выглядит спокойным.
+            ev_cols = ["test", "switch", "port", "ts_start", "ts_end", "attribution",
+                       "fec_uncorrected", "fec_corrected", "carrier_transitions",
+                       "counter_reset", "link_disturbed"] + HARD_ERROR_COLS
+            df_ev = _prepare_for_excel(context.get("error_events", pd.DataFrame()))
+            if df_ev.empty:
+                df_ev = pd.DataFrame([{"test": "—", "switch": "—", "port": "—",
+                                       "attribution": "Событий ошибок не зафиксировано"}])
+            else:
+                df_ev = df_ev[[c for c in ev_cols if c in df_ev.columns]]
+            sheets.append(("Реестр событий ошибок", df_ev))
+
+            # --- 8. Методика и пороги ------------------------------------------
             sheets.append(("Методика и пороги", context.get("methodology_df", pd.DataFrame())))
 
-            # --- 8. Диагностика парсинга ---------------------------------------
+            # --- 9. Диагностика парсинга ---------------------------------------
             df_iss = pd.DataFrame([{
                 "file": i.file, "snapshot_index": i.snapshot_index,
                 "timestamp": i.timestamp, "severity": i.severity, "message": i.message,
@@ -2930,8 +3378,8 @@ def build_executive_summary(
     # --- абзац 1: что и как тестировали ---------------------------------------
     paras.append(
         f"Проанализировано {n_sockets} посадочных мест в {n_tests} круг(ах) ротации; "
-        f"суммарная полезная наработка после исключения краевых окон монтажа — "
-        f"{total_hours:,.0f} часов".replace(",", " ") +
+        f"суммарная наработка в стабильном режиме (линк Up, без флапов и сбросов "
+        f"счётчика) — {total_hours:,.0f} часов".replace(",", " ") +
         f". Профиль оптики: {profile.name}. "
         f"Источники: {context.get('files_str', '—')}. "
         f"Интервал опроса — {context.get('poll_interval_str', '—')}."
@@ -2946,6 +3394,46 @@ def build_executive_summary(
         f"<b>{n_fail}</b> подлежат отбраковке" +
         (f", по {n_unk} данных недостаточно" if n_unk else "") + "."
     )
+
+    # --- абзац 2а: неисправляемые FEC-ошибки, главный признак ------------------
+    # Этот абзац стоит перед разбором вердиктов намеренно: неисправляемая
+    # FEC-ошибка означает потерянный кадр и является первичным основанием
+    # для отбраковки. Её нельзя прятать в примечания.
+    if not df_sockets.empty and "fec_uncorrected" in df_sockets.columns:
+        unc = pd.to_numeric(df_sockets["fec_uncorrected"], errors="coerce").fillna(0)
+        unc_st = pd.to_numeric(df_sockets.get("fec_uncorrected_stable",
+                                              pd.Series(0, index=df_sockets.index)),
+                               errors="coerce").fillna(0)
+        n_with = int((unc > 0).sum())
+        n_stable = int((unc_st > 0).sum())
+        if n_with:
+            worst = df_sockets.loc[unc.idxmax()]
+            listing = ", ".join(
+                f"{r['switch']}:{port_short(r['port'])} (К{r['test']}) — "
+                f"{fmt_count(u)}"
+                for (_, r), u in sorted(
+                    zip(df_sockets.iterrows(), unc), key=lambda z: -z[1])[:6] if u > 0)
+            para = (f"<b>Неисправляемые FEC-ошибки зафиксированы на {n_with} из "
+                    f"{n_sockets} посадочных мест</b>, суммарно "
+                    f"{fmt_count(float(unc.sum()))}. Худшее: "
+                    f"{worst['switch']}:{port_short(worst['port'])} "
+                    f"(круг {worst['test']}) — {fmt_count(float(unc.max()))}. "
+                    f"По местам: {listing}.")
+            if n_stable:
+                para += (f" <b>Из них на {n_stable} мест(ах) ошибки набраны при "
+                         f"поднятом линке, без флапов, сбросов счётчика и "
+                         f"возмущений на дальнем конце</b> — это свойство тракта, "
+                         f"а не следствие монтажных работ.")
+            else:
+                para += (" <b>Ни одна из них не набрана в стабильном режиме:</b> все "
+                         "пришлись на интервалы с потерей линка, флапом, сбросом "
+                         "счётчика, возмущением на дальнем конце линка либо внутри "
+                         "окна работ в стойке. Обстоятельства каждого события "
+                         "приведены в разделе «Реестр событий ошибок».")
+            paras.append(para)
+        else:
+            paras.append("<b>Неисправляемых FEC-ошибок не зафиксировано ни на одном "
+                         "посадочном месте за весь период наблюдения.</b>")
 
     # --- абзац 3: брак и его причины -------------------------------------------
     if n_fail:
@@ -3009,31 +3497,43 @@ def build_executive_summary(
             "кросс-раундовые выводы будут построены автоматически."
         )
 
+    # --- абзац 5а: окна работ в стойке -----------------------------------------
+    windows = context.get("maintenance_windows") or []
+    if windows:
+        listing = "; ".join(f"{a0:%d.%m %H:%M} — {b0:%d.%m %H:%M}" for a0, b0 in windows)
+        paras.append(
+            f"<b>Обнаружено окно работ в стойке: {listing}.</b> Признак — "
+            f"одновременное возмущение сразу на нескольких портах, в том числе на "
+            f"обоих коммутаторах; это вывод из данных, а не предположение. "
+            f"Логирование в этот момент не останавливалось, поэтому счётчики "
+            f"зафиксировали пересадку модулей как лавину ошибок. Интервалы внутри "
+            f"окна и интервалы, где возмущение пришло с дальнего конца линка, "
+            f"помечены соответствующей категорией: их величины полностью сохранены "
+            f"в отчёте, но по умолчанию не служат основанием для отбраковки "
+            f"(изменить: --uncorrected-policy strict). "
+            f"Чтобы устранить эту неоднозначность в следующем прогоне, достаточно "
+            f"останавливать сбор логов перед физическими работами либо объявлять "
+            f"окно ключом --maintenance-window."
+        )
+
     # --- абзац 6: методические оговорки ----------------------------------------
     notes = []
-    edge_ct = (float(pd.to_numeric(df_sockets.get("edge_carrier_transitions",
-                                                  pd.Series(dtype=float)),
-                                   errors="coerce").fillna(0).sum())
-               if not df_sockets.empty else 0.0)
-    edge_unc = (float(pd.to_numeric(df_sockets.get("edge_fec_uncorrected",
-                                                   pd.Series(dtype=float)),
-                                    errors="coerce").fillna(0).sum())
-                if not df_sockets.empty else 0.0)
-    if edge_ct or edge_unc:
-        notes.append(
-            f"В краевых окнах монтажа/демонтажа (первые {context['head_guard']:g} "
-            f"и последние {context['tail_guard']:g} мин каждого захвата) "
-            f"зафиксировано {fmt_count(edge_ct)} carrier transitions и "
-            f"{fmt_count(edge_unc)} неисправляемых FEC-ошибок. Это артефакты "
-            f"физического вмешательства оператора, а не свойство модулей — "
-            f"они исключены из метрик и приведены отдельной колонкой."
-        )
     resets = (int(context.get("counter_resets", 0)))
     if resets:
         notes.append(
-            f"Обнаружено {resets} сброс(ов) кумулятивных счётчиков Junos. "
+            f"Обнаружено {resets} сброс(ов) кумулятивных счётчиков Junos "
+            f"(clear interfaces statistics либо пересоздание интерфейса). "
             f"Поэтому все метрики построены на поинтервальных дельтах: разница "
             f"«первое значение минус последнее» дала бы заведомо неверный результат."
+        )
+    not_zero = (int((~df_sockets["counter_zero_based"].fillna(True)).sum())
+                if "counter_zero_based" in df_sockets.columns else 0)
+    if not_zero:
+        notes.append(
+            f"У {not_zero} посадочных мест счётчики не были обнулены перед началом "
+            f"прогона — стартовое значение унаследовано от предыдущего круга. "
+            f"В метриках учитывается прирост за захват, а не абсолютное значение "
+            f"счётчика; абсолютные величины приведены отдельными колонками."
         )
     if context.get("tz_conflict"):
         notes.append(
@@ -3085,8 +3585,9 @@ def make_socket_table(
     df_sockets: pd.DataFrame, styles: Dict[str, ParagraphStyle], width: float,
 ) -> Table:
     """Подробная таблица метрик по каждому посадочному месту."""
-    header = ["Круг", "Свитч", "Порт", "Вердикт", "FEC Corr.", "FEC Uncorr.",
-              "Скорость, ош./с", "pre-FEC BER", "Флапы", "Полезн., ч", "Годных инт."]
+    header = ["Круг", "Свитч", "Порт", "Вердикт", "FEC Uncorr.\nвсего",
+              "из них в\nстабильном", "Флапы\nвне работ", "FEC Corr.", "Скорость, ош./с",
+              "pre-FEC BER", "Стаб., ч", "Стаб. инт."]
     rows: List[List[Any]] = [[_para(h, styles["cell_c"]) for h in header]]
     style_cmds: List[Tuple] = list(TABLE_BASE_STYLE) + _header_style(len(header))
 
@@ -3097,20 +3598,81 @@ def make_socket_table(
             _para(r.get("switch"), styles["cell_c"]),
             _para(port_short(r.get("port")), styles["cell_c"]),
             _para(verdict, styles["cell_c"]),
+            _para(fmt_count(r.get("fec_uncorrected")),
+                  styles["cell_b"] if float(r.get("fec_uncorrected") or 0) > 0
+                  else styles["cell_c"]),
+            _para(fmt_count(r.get("fec_uncorrected_stable")),
+                  styles["cell_b"] if float(r.get("fec_uncorrected_stable") or 0) > 0
+                  else styles["cell_c"]),
+            _para(fmt_count(r.get("link_flaps_own")), styles["cell_c"]),
             _para(fmt_count(r.get("fec_corrected")), styles["cell_c"]),
-            _para(fmt_count(r.get("fec_uncorrected")), styles["cell_c"]),
             _para(fmt_num(r.get("fec_corrected_rate_eps"), 1), styles["cell_c"]),
             _para(fmt_ber(r.get("ber_pre_fec_est")), styles["cell_c"]),
-            _para(fmt_count(r.get("link_flaps")), styles["cell_c"]),
             _para(fmt_num(float(r.get("soak_seconds") or 0) / 3600.0, 1), styles["cell_c"]),
-            _para(f"{int(r.get('intervals_usable') or 0)}/{int(r.get('intervals_total') or 0)}",
+            _para(f"{int(r.get('intervals_stable') or 0)}/{int(r.get('intervals_total') or 0)}",
                   styles["cell_c"]),
         ])
         status = STATUS_BY_VERDICT.get(verdict, "#898781")
         style_cmds.append(("BACKGROUND", (3, i), (3, i), _tint(status, 0.72)))
+        # Ненулевые неисправляемые ошибки подсвечиваем всегда: это первичный
+        # признак браковки, и он не должен теряться среди прочих колонок.
+        if float(r.get("fec_uncorrected") or 0) > 0:
+            style_cmds.append(("BACKGROUND", (4, i), (4, i),
+                               _tint(STATUS_WARNING, 0.70)))
+        if float(r.get("fec_uncorrected_stable") or 0) > 0:
+            style_cmds.append(("BACKGROUND", (5, i), (5, i),
+                               _tint(STATUS_CRITICAL, 0.70)))
 
     col_widths = [width * w for w in
-                  (0.055, 0.075, 0.055, 0.135, 0.105, 0.095, 0.105, 0.105, 0.06, 0.09, 0.08)]
+                  (0.05, 0.065, 0.05, 0.125, 0.085, 0.085, 0.055, 0.095, 0.09,
+                   0.095, 0.06, 0.065)]
+    table = Table(rows, colWidths=col_widths, repeatRows=1, hAlign="LEFT")
+    table.setStyle(TableStyle(style_cmds))
+    return table
+
+
+def make_events_table(
+    df_events: pd.DataFrame, styles: Dict[str, ParagraphStyle], width: float,
+    limit: int = 40,
+) -> Table:
+    """
+    Реестр событий ошибок: когда, где, сколько и при каких обстоятельствах.
+
+    Это ключевая таблица отчёта. Она отвечает на вопрос, который сводные
+    метрики скрывают: неисправляемая FEC-ошибка была зафиксирована в стабильном
+    прогоне или в момент, когда линк передёргивали.
+    """
+    header = ["Круг", "Свитч", "Порт", "Время события", "Обстоятельства",
+              "FEC Uncorr.", "FEC Corr.", "Carrier trans."]
+    rows: List[List[Any]] = [[_para(h, styles["cell_c"]) for h in header]]
+    style_cmds: List[Tuple] = list(TABLE_BASE_STYLE) + _header_style(len(header))
+
+    shown = df_events.head(limit)
+    for i, (_, r) in enumerate(shown.iterrows(), start=1):
+        unc = float(r.get("fec_uncorrected") or 0)
+        code = r.get("attribution_code", "")
+        rows.append([
+            _para(f"К{r.get('test')}", styles["cell_c"]),
+            _para(r.get("switch"), styles["cell_c"]),
+            _para(port_short(r.get("port")), styles["cell_c"]),
+            _para(f"{r['ts_end']:%d.%m %H:%M}" if pd.notna(r.get("ts_end")) else "—",
+                  styles["cell_c"]),
+            _para(r.get("attribution"), styles["cell"]),
+            _para(fmt_count(unc), styles["cell_b"] if unc > 0 else styles["cell_c"]),
+            _para(fmt_count(r.get("fec_corrected")), styles["cell_c"]),
+            _para(fmt_count(r.get("carrier_transitions")), styles["cell_c"]),
+        ])
+        # Красным выделяется только самый тяжёлый случай: неисправляемые ошибки
+        # в стабильном прогоне. Цвет сопровождается текстом в колонке
+        # «Обстоятельства», то есть смысл не несётся одним лишь цветом.
+        if unc > 0:
+            tone = STATUS_CRITICAL if code == "STABLE" else STATUS_WARNING
+            style_cmds.append(("BACKGROUND", (5, i), (5, i), _tint(tone, 0.70)))
+            style_cmds.append(("LINEBEFORE", (0, i), (0, i), 3,
+                               rl_colors.HexColor(tone)))
+
+    col_widths = [width * w for w in
+                  (0.055, 0.075, 0.055, 0.115, 0.30, 0.14, 0.13, 0.13)]
     table = Table(rows, colWidths=col_widths, repeatRows=1, hAlign="LEFT")
     table.setStyle(TableStyle(style_cmds))
     return table
@@ -3289,11 +3851,7 @@ def build_pdf(
         story.append(Spacer(1, 4 * mm))
         ber_chart = charts_dir / "overview_ber.png"
         if ber_chart.exists():
-            story.append(KeepTogether([
-                _para("Качество линка: оценочный pre-FEC BER", styles["h2"]),
-                Image(str(ber_chart), width=avail,
-                      height=avail * _img_ratio(ber_chart)),
-            ]))
+            story.append(_fit_image(ber_chart, avail, doc.height - 14 * mm))
         story.append(PageBreak())
 
         # ----------------------------------------------------- линки ----------
@@ -3309,6 +3867,39 @@ def build_pdf(
             story.append(make_link_table(df_links, styles, avail))
             story.append(PageBreak())
 
+        # ------------------------------------------- реестр событий ошибок -----
+        df_events = context.get("error_events", pd.DataFrame())
+        story.append(_para("СОБЫТИЯ", styles["kicker"]))
+        story.append(_para("Реестр событий ошибок", styles["h1"]))
+        if df_events is None or df_events.empty:
+            story.append(_para(
+                "За весь период наблюдения не зафиксировано ни одного прироста "
+                "неисправляемых FEC-ошибок, carrier transitions или input/CRC/bit "
+                "errors.", styles["body"]))
+        else:
+            n_unc = int((pd.to_numeric(df_events["fec_uncorrected"],
+                                       errors="coerce").fillna(0) > 0).sum())
+            n_stable = int(((pd.to_numeric(df_events["fec_uncorrected"],
+                                           errors="coerce").fillna(0) > 0)
+                            & (df_events["attribution_code"] == "STABLE")).sum())
+            story.append(_para(
+                f"Зафиксировано {len(df_events)} интервал(ов) с приростом жёстких "
+                f"счётчиков, из них {n_unc} с неисправляемыми FEC-ошибками "
+                f"({n_stable} — в стабильном прогоне, то есть при поднятом линке, "
+                f"без флапов и сбросов счётчика). Колонка «Обстоятельства» "
+                f"определяется по состоянию линка и счётчиков в самом логе, а не "
+                f"по предположениям о действиях оператора. Ни одно из этих событий "
+                f"не исключается из вердикта: неисправляемая FEC-ошибка означает "
+                f"потерянный кадр.", styles["body"]))
+            story.append(make_events_table(df_events, styles, avail))
+            if len(df_events) > 40:
+                story.append(Spacer(1, 2 * mm))
+                story.append(_para(
+                    f"Показаны первые 40 событий из {len(df_events)}. "
+                    f"Полный реестр — на листе «Реестр событий ошибок» в Excel.",
+                    styles["small"]))
+        story.append(PageBreak())
+
         # ------------------------------------------- постраничная детализация --
         story.append(_para("ГРАФИКИ", styles["kicker"]))
         story.append(_para("Динамика DOM и ошибок по каждому посадочному месту",
@@ -3316,8 +3907,12 @@ def build_pdf(
         story.append(_para(
             "Для каждого места приведены: прогрев (температура и ток смещения по "
             "линиям), оптическая мощность TX/RX по каждой из четырёх линий QSFP28 "
-            "с границами даташита, и временной ряд FEC-ошибок. Серой заливкой на "
-            "графиках FEC отмечены интервалы, исключённые из расчёта метрик.",
+            "с границами даташита, и временной ряд FEC-ошибок. Серой заливкой "
+            "отмечены нештатные интервалы (флап линка, сброс счётчика, потеря "
+            "сигнала): данные в них выводятся и учитываются в вердикте — заливка "
+            "указывает на обстоятельства, а не исключает значение. Каждое событие "
+            "неисправляемых ошибок помечено маркой: круг — в стабильном прогоне, "
+            "треугольник — в нештатном интервале.",
             styles["body"]))
         story.append(Spacer(1, 2 * mm))
 
@@ -3353,8 +3948,7 @@ def build_pdf(
             for suffix in ("thermal", "power", "fec"):
                 img = charts_dir / f"{slug}_{suffix}.png"
                 if img.exists():
-                    story.append(Image(str(img), width=img_w,
-                                       height=img_w * _img_ratio(img)))
+                    story.append(_fit_image(img, img_w, doc.height - 6 * mm))
                     story.append(Spacer(1, 2.0 * mm))
 
         # ---------------------------------------------- методика приложением ---
@@ -3411,6 +4005,22 @@ def build_pdf(
         return None
 
 
+def _fit_image(path: Path, max_w: float, max_h: float) -> Image:
+    """
+    Вставляет картинку, вписывая её в доступную область.
+
+    Без этого высокий график (например, обзорная панель на много строк) при
+    полной ширине превышает высоту фрейма, и ReportLab отклоняет весь документ.
+    """
+    ratio = _img_ratio(path)
+    w = max_w
+    h = w * ratio
+    if h > max_h:
+        h = max_h
+        w = h / ratio if ratio else max_w
+    return Image(str(path), width=w, height=h)
+
+
 def _img_ratio(path: Path) -> float:
     """Отношение высоты к ширине PNG — чтобы вставлять картинку без искажений."""
     try:
@@ -3441,7 +4051,13 @@ def build_methodology_table(
         ("Температура, °C", f"{profile.temp_c_min} … {profile.temp_c_max}",
          "Диапазон коммерческого исполнения."),
         ("FEC Uncorrected", f"> {th.uncorrected_fail}",
-         "Любая неисправляемая FEC-ошибка в пригодном интервале — брак."),
+         "Любая неисправляемая FEC-ошибка в СТАБИЛЬНОМ интервале — брак."),
+        ("Политика по Uncorrected", th.uncorrected_policy,
+         "'attributed' — ошибки, отнесённые к работам в стойке, выводятся, но не "
+         "бракуют; 'strict' — брак по любому uncorrected > 0."),
+        ("Окна работ в стойке", "по данным + вручную",
+         "Автоматически: одновременное возмущение на 2+ портах. Вручную: "
+         "--maintenance-window 'НАЧАЛО,КОНЕЦ'."),
         ("pre-FEC BER «эталон»", fmt_ber(th.ber_pass_max),
          "Ниже порога — линк считается эталонно чистым (в ЗИП)."),
         ("pre-FEC BER «без запаса»", fmt_ber(th.ber_warn_max),
@@ -3470,14 +4086,27 @@ def build_methodology_table(
          "Короче — наклон не экстраполируется на сутки, критерий не применяется."),
         ("Минимум снимков для перекоса", f"{th.min_samples_for_dom_stats}",
          "Меньше — перекос между линиями не оценивается."),
+        ("Минимум наработки для ЗИП", f"{th.min_hours_for_pass:g} ч",
+         "Короче — положительный вердикт не выносится: отсутствие ошибок за "
+         "малый срок ничего не доказывает."),
+        ("Жёсткие счётчики", "весь захват",
+         "FEC Uncorrected, флапы, input/CRC/bit errors суммируются по всему "
+         "захвату и не могут быть обнулены ни одним окном или фильтром."),
+        ("Скорости и BER", "стабильные интервалы",
+         "Считаются только там, где линк Up, нет флапов, сбросов и дефектов."),
+        ("Классификация интервалов", "по логу",
+         "STABLE / FLAP / RESET / LINK_DOWN / GAP — определяется состоянием линка "
+         "и счётчиков, а не предположениями о действиях оператора."),
         ("Краевое окно на старте", f"{context['head_guard']:g} мин",
-         "Исключается из метрик: установка модулей, синхронизация линка."),
+         "Исключается ТОЛЬКО из статистики DOM: снимок с вынутым модулем даёт "
+         "ложный выход RX за границы даташита. На счётчики ошибок не влияет."),
         ("Краевое окно на финише", f"{context['tail_guard']:g} мин",
-         "Исключается из метрик: демонтаж и ротация модулей оператором."),
+         "То же для конца захвата. На счётчики ошибок не влияет."),
         ("Обработка сбросов счётчиков", "автоматическая",
-         "Отрицательная дельта трактуется как сброс; интервал исключается."),
+         "Отрицательная дельта = сброс; приростом считается значение после сброса, "
+         "интервал помечается категорией RESET и остаётся в учёте."),
         ("Обработка пропусков опроса", "автоматическая",
-         "Интервал длиннее 3 медиан считается пропуском и исключается."),
+         "Интервал длиннее 3 медиан помечается категорией GAP."),
     ]
     return pd.DataFrame(rows, columns=["Параметр", "Значение", "Комментарий"])
 
@@ -3553,6 +4182,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="Порог pre-FEC BER для вердикта «в ЗИП».")
     p.add_argument("--ber-warn-max", type=float, default=None,
                    help="Порог pre-FEC BER, выше которого выносится брак.")
+    p.add_argument("--uncorrected-policy", choices=["attributed", "strict"],
+                   default="attributed",
+                   help="Как трактовать FEC Uncorrected, отнесённые к работам в "
+                        "стойке: 'attributed' (по умолчанию) — не браковать, но "
+                        "выводить в отчёте; 'strict' — браковать по любому "
+                        "uncorrected > 0.")
+    p.add_argument("--maintenance-window", action="append", default=None,
+                   metavar="'НАЧАЛО,КОНЕЦ'",
+                   help="Окно работ в стойке в формате "
+                        "'ГГГГ-ММ-ДД ЧЧ:ММ,ГГГГ-ММ-ДД ЧЧ:ММ'; можно указать "
+                        "несколько раз. Дополняет окна, найденные автоматически.")
+    p.add_argument("--no-auto-maintenance", action="store_true",
+                   help="Не искать окна работ автоматически (только объявленные).")
     p.add_argument("--no-charts", action="store_true",
                    help="Не строить графики (быстрый прогон, только Excel).")
     p.add_argument("--no-pdf", action="store_true", help="Не формировать PDF.")
@@ -3619,6 +4261,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         th.ber_pass_max = args.ber_pass_max
     if args.ber_warn_max is not None:
         th.ber_warn_max = args.ber_warn_max
+    th.uncorrected_policy = args.uncorrected_policy
 
     # Краевые окна размечаются и для счётчиков, и для DOM: снимок с извлечённым
     # модулем иначе даст ложный выход RX за границы даташита.
@@ -3627,7 +4270,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         df_dom_raw = mark_edge_windows(df_dom_raw, args.head_guard_min,
                                        args.tail_guard_min)
     df_intervals = compute_intervals(df_ports)
+
+    # Уточняем причину каждого интервала с учётом партнёра по линку и
+    # одновременных возмущений на других портах. Без этого шага изъятие модуля
+    # на дальнем конце выглядит как отказ ближнего.
+    manual_windows: List[Tuple[datetime, datetime]] = []
+    for spec in (args.maintenance_window or []):
+        try:
+            a_raw, b_raw = [x.strip() for x in spec.split(",", 1)]
+            manual_windows.append((pd.Timestamp(a_raw).to_pydatetime(),
+                                   pd.Timestamp(b_raw).to_pydatetime()))
+        except Exception as exc:  # noqa: BLE001
+            LOG.error("Не удалось разобрать --maintenance-window %r: %s", spec, exc)
+    df_intervals, maint_windows = apply_disturbance_correlation(
+        df_intervals, manual_windows,
+        min_ports=(10 ** 6 if args.no_auto_maintenance else 2))
+
+    if maint_windows:
+        LOG.info("Окна работ в стойке (возмущение сразу на нескольких портах):")
+        for a0, b0 in maint_windows:
+            LOG.info("  %s — %s", a0.strftime("%d.%m %H:%M:%S"),
+                     b0.strftime("%d.%m %H:%M:%S"))
+
     df_err = summarize_error_metrics(df_ports, df_intervals)
+    df_events = build_error_events(df_intervals)
     df_dom_summary = summarize_dom(df_dom_raw, profile, th)
 
     # ------------------------------------------------------ 4. вердикты --------
@@ -3665,6 +4331,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "tz_conflict": " / ".join(tz_labels) if len(tz_labels) > 1 else None,
         "report_title": "Приёмочный soak-тест QSFP28 · Juniper QFX5110-48S-4C",
     }
+    context["error_events"] = df_events
+    context["maintenance_windows"] = maint_windows
     context["methodology_df"] = build_methodology_table(profile, th, context)
 
     # ------------------------------------------------------ 6. отчёты ----------
